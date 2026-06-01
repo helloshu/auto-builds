@@ -80,14 +80,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 测试 Job 的缓存 key 独立于所有架构，避免与 build-desktop 互相污染
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          # 测试无需 target-specific cache，使用固定 key
           key: test-ubuntu-x86_64
 
-      # cargo test 会编译整个 crate（含 wry/tauri），需 webkit2gtk 系统依赖
       - name: 安装 Linux 系统依赖
         run: |
           sudo apt-get update
@@ -110,7 +107,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── macOS ARM64 ──────────────────────────────────────────────
           - os: macos-latest
             target: aarch64-apple-darwin
             os_name: macos
@@ -120,7 +116,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── macOS x86_64 ─────────────────────────────────────────────
           - os: macos-13
             target: x86_64-apple-darwin
             os_name: macos
@@ -130,7 +125,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── Linux x86_64 ─────────────────────────────────────────────
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             os_name: linux
@@ -140,7 +134,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── Linux ARM64 ─────────────────────────────────────────────
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             os_name: linux
@@ -150,17 +143,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── Linux x86_64 ─────────────────────────────────────────────
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            os_name: linux
-            arch: x86_64-musl
-            cache_key: linux-x86_64-musl
-            cross: false
-            cli_only: true
-            experimental: true
-
-          # ── Windows x86_64 ───────────────────────────────────────────
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             os_name: windows
@@ -170,7 +152,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── Windows ARM64 ★ ─────────────────────────────────────────────
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             os_name: windows
@@ -180,7 +161,6 @@ jobs:
             cli_only: false
             experimental: false
 
-          # ── Windows 32-bit ★ ─────────────────────────────────────────────
           - os: windows-latest
             target: i686-pc-windows-msvc
             os_name: windows
@@ -206,19 +186,15 @@ jobs:
 
       - run: npm ci
 
-      # ── Rust 工具链 ──────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # ── Rust 缓存物理隔离 ─────────────────────────────────────────────
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          # 物理隔离：key 包含 os + arch，8 个 job 互不干扰
           key: desktop-${{ matrix.cache_key }}
 
-      # ── Linux 系统依赖 ────────────────────────────────────────────────
       - name: 安装 Linux 系统依赖 (glibc / GUI)
         if: runner.os == 'Linux' && matrix.cli_only == false
         run: |
@@ -227,15 +203,6 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev
 
-      - name: 安装 musl 静态链接工具链
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # 验证 musl-gcc 可用
-          musl-gcc --version
-
-      # ── 同步版本号 ─────────────────────────────────────────────
       - name: 同步版本号
         shell: bash
         run: |
@@ -247,17 +214,11 @@ jobs:
           sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml && rm -f Cargo.toml.bak
           echo "版本同步完成: $VERSION"
 
-      # ── 编译 CLI 工具（注入 Tauri Sidecar）───────────────────────────
       - name: 编译 rssh-cli (Sidecar)
         working-directory: src-tauri
         shell: bash
-        run: |
-          if [ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]; then
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          fi
-          cargo build --release --features cli --bin rssh-cli --target ${{ matrix.target }}
+        run: cargo build --release --features cli --bin rssh-cli --target ${{ matrix.target }}
 
-      # ── 存放 CLI 以备 Tauri 打包（musl/cli_only 跳过）──────────────
       - name: 存放 CLI 以备打包
         if: matrix.cli_only == false
         shell: bash
@@ -267,7 +228,6 @@ jobs:
           if [[ "${{ matrix.target }}" == *windows* ]]; then NAME="rssh-cli.exe"; fi
           cp "src-tauri/target/${{ matrix.target }}/release/${NAME}" src-tauri/bin/
 
-      # ── 编译 Tauri GUI（交叉编译 / cli_only 跳过）───────────────────
       - name: 编译 Tauri GUI
         if: matrix.cli_only == false && matrix.cross == false
         shell: bash
@@ -275,7 +235,6 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
 
-      # ── macOS 签名验证 ───────────────────────────────────────────────
       - name: 验证 macOS 代码签名
         if: runner.os == 'macOS' && matrix.cli_only == false && matrix.cross == false
         run: |
@@ -286,6 +245,7 @@ jobs:
           for dmg in "$BUNDLE"/dmg/*.dmg; do
             if [ -f "$dmg" ]; then
               echo "DMG: $dmg"
+              # DMG 本身不签名，检查挂载后的 .app
               hdiutil attach "$dmg" -mountpoint /tmp/rssh_verify -quiet
               codesign --verify --verbose /tmp/rssh_verify/*.app 2>&1 || true
               hdiutil detach /tmp/rssh_verify -quiet
@@ -301,7 +261,6 @@ jobs:
             fi
           done
 
-      # ── 重命名并整理安装包产物 ────────────────────────────────────────
       - name: 重命名并整理安装包产物
         if: matrix.cli_only == false && matrix.cross == false
         shell: bash
@@ -322,7 +281,6 @@ jobs:
 
           ls -lh dist/ || echo "(dist 目录为空，可能仅构建了 CLI)"
 
-      # ── CLI Only 产物打包（musl + 原交叉编译 ARM64）────────────────
       - name: 打包 CLI Only 产物
         if: matrix.cli_only == true || matrix.cross == true
         shell: bash
@@ -338,13 +296,13 @@ jobs:
           fi
           ls -lh dist/
 
-      # ── Windows 便携版 ZIP ─────────────────────────────────────────────
       - name: 制作 Windows 便携版 ZIP
         if: runner.os == 'Windows' && matrix.cli_only == false
         shell: bash
         run: |
           VERSION="${{ needs.check-update.outputs.tag }}"
           VERSION="${VERSION#v}"
+          # ★ 关键：使用 matrix.arch 动态命名，3 个架构完全隔离
           PORTABLE="rssh-${VERSION}-windows-${{ matrix.arch }}-portable"
           REL="src-tauri/target/${{ matrix.target }}/release"
           mkdir -p "${PORTABLE}"
@@ -372,7 +330,6 @@ jobs:
           7z a "dist/${PORTABLE}.zip" "${PORTABLE}/"
           ls -lh dist/
 
-      # ── 上传桌面端产物至 Release ──────────────────────────────────────
       - name: 发布桌面端产物
         uses: softprops/action-gh-release@v2
         with:
@@ -391,9 +348,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ════════════════════════════════════════════════════════════════════
-  # 任务 4：Android 移动端
-  # ════════════════════════════════════════════════════════════════════
   build-android:
     needs: [check-update, test]
     if: needs.check-update.outputs.skip == 'false'
@@ -499,5 +453,3 @@ jobs:
           files: dist/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-
