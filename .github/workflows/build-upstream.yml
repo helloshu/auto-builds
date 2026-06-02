@@ -15,6 +15,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
 
@@ -477,6 +480,21 @@ jobs:
           tar czf "rssh-${VERSION}-source.tar.gz" "${SRC_NAME}"
           echo "::notice::源码包已生成: rssh-${VERSION}-source.tar.gz ($(du -h rssh-${VERSION}-source.tar.gz | cut -f1))"
 
+      - name: 获取上游 Release 描述
+        id: upstream_notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-update.outputs.tag }}"
+          UPSTREAM_BODY=$(gh release view "$TAG" --repo shihuili1218/rssh --json body -q '.body' 2>/dev/null || true)
+          if [ -n "$UPSTREAM_BODY" ]; then
+            echo "$UPSTREAM_BODY" > /tmp/upstream_notes.md
+            echo "has_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 更新 Release 描述并上传源码
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -490,7 +508,6 @@ jobs:
           COMMIT=$(git rev-parse --short HEAD)
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M UTC")
 
-          # ═══ 生成 Release 正文 ═══
           cat > /tmp/release_body.md << BODYEOF
           ## 构建信息
 
@@ -502,32 +519,14 @@ jobs:
           | 构建运行 | [#${RUN_ID}](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) |
           | 构建时间 | ${BUILD_TIME} |
           | 提交哈希 | \`${COMMIT}\` |
+          BODYEOF
 
-          ## 产物列表
+          if [ -s /tmp/upstream_notes.md ]; then
+            echo "" >> /tmp/release_body.md
+            cat /tmp/upstream_notes.md >> /tmp/release_body.md
+          fi
 
-          ### 桌面端
-
-          | 平台 | 架构 | 格式 |
-          |------|------|------|
-          | macOS | ARM64 (Apple Silicon) | DMG |
-          | macOS | x86_64 (Intel) | DMG |
-          | Linux | x86_64 | deb, rpm, AppImage |
-          | Linux | ARM64 | deb, rpm, AppImage |
-          | Windows | x86_64 | MSI, NSIS, Portable ZIP |
-          | Windows | ARM64 | MSI, NSIS, Portable ZIP |
-          | Windows | i686 (32-bit) | MSI, NSIS, Portable ZIP |
-
-          ### 移动端
-
-          | 平台 | 架构 | 格式 |
-          |------|------|------|
-          | Android | universal (arm64-v8a + armeabi-v7a + x86_64 + x86) | APK |
-
-          ### 源码
-
-          | 文件 | 说明 |
-          |------|------|
-          | \`rssh-${VERSION}-source.tar.gz\` | 上游源码归档（已排除 .git / target / node_modules / dist） |
+          cat >> /tmp/release_body.md << BODYEOF
 
           ---
 
