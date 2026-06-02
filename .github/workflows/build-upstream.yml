@@ -17,7 +17,6 @@ concurrency:
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
   check-update:
@@ -339,13 +338,7 @@ jobs:
           name: "RSSH ${{ needs.check-update.outputs.tag }} (Auto Build)"
           draft: false
           prerelease: false
-          body: |
-            > ⚠️ **安全声明**：本 Release 由 [`${{ github.repository }}`](${{ github.server_url }}/${{ github.repository }}) 从上游源码自动编译，非官方发布。
-            > 上游仓库：[shihuili1218/rssh](https://github.com/shihuili1218/rssh) · 版本：`${{ needs.check-update.outputs.tag }}`
-            > 构建时间：`${{ github.run_id }}` · 编译环境：GitHub Actions hosted runners
-            >
-            > **macOS 用户注意**：DMG 使用 ad-hoc 签名（未经过 Apple 公证）。首次打开时若提示"无法验证开发者"，
-            > 请右键点击 App → 选择"打开"，或执行：`xattr -cr /Applications/rssh.app`
+          body: "构建进行中，完整更新说明将在所有平台编译完成后自动生成。"
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -449,9 +442,115 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-update.outputs.tag }}
-          name: "RSSH ${{ needs.check-update.outputs.tag }} (Auto Build)"
           draft: false
           prerelease: false
           files: dist/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-finalize:
+    needs: [check-update, build-desktop, build-android]
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout 上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.tag }}
+
+      - name: 生成源码压缩包
+        run: |
+          VERSION="${{ needs.check-update.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          SRC_NAME="rssh-${VERSION}-source"
+          mkdir -p "${SRC_NAME}"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='src-tauri/target' \
+            --exclude='node_modules' \
+            --exclude='dist' \
+            ./ "${SRC_NAME}/"
+          tar czf "rssh-${VERSION}-source.tar.gz" "${SRC_NAME}"
+          echo "::notice::源码包已生成: rssh-${VERSION}-source.tar.gz ($(du -h rssh-${VERSION}-source.tar.gz | cut -f1))"
+
+      - name: 更新 Release 描述并上传源码
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          REPO="${{ github.repository }}"
+          SERVER_URL="${{ github.server_url }}"
+          RUN_ID="${{ github.run_id }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          # ═══ 生成 Release 正文 ═══
+          cat > /tmp/release_body.md << BODYEOF
+          ## 构建信息
+
+          | 项目 | 值 |
+          |------|-----|
+          | 上游仓库 | [shihuili1218/rssh](https://github.com/shihuili1218/rssh) |
+          | 上游版本 | \`${TAG}\` |
+          | 编译仓库 | [${REPO}](${SERVER_URL}/${REPO}) |
+          | 构建运行 | [#${RUN_ID}](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) |
+          | 构建时间 | ${BUILD_TIME} |
+          | 提交哈希 | \`${COMMIT}\` |
+
+          ## 产物列表
+
+          ### 桌面端
+
+          | 平台 | 架构 | 格式 |
+          |------|------|------|
+          | macOS | ARM64 (Apple Silicon) | DMG |
+          | macOS | x86_64 (Intel) | DMG |
+          | Linux | x86_64 | deb, rpm, AppImage |
+          | Linux | ARM64 | deb, rpm, AppImage |
+          | Windows | x86_64 | MSI, NSIS, Portable ZIP |
+          | Windows | ARM64 | MSI, NSIS, Portable ZIP |
+          | Windows | i686 (32-bit) | MSI, NSIS, Portable ZIP |
+
+          ### 移动端
+
+          | 平台 | 架构 | 格式 |
+          |------|------|------|
+          | Android | universal (arm64-v8a + armeabi-v7a + x86_64 + x86) | APK |
+
+          ### 源码
+
+          | 文件 | 说明 |
+          |------|------|
+          | \`rssh-${VERSION}-source.tar.gz\` | 上游源码归档（已排除 .git / target / node_modules / dist） |
+
+          ---
+
+          > ⚠️ **安全声明**：本 Release 由 ${REPO} 从上游源码自动编译，**非官方发布**。
+          > 上游仓库：[shihuili1218/rssh](https://github.com/shihuili1218/rssh) · 版本：\`${TAG}\`
+          > 构建时间：${RUN_ID} · 编译环境：GitHub Actions hosted runners
+          >
+          > **macOS 用户注意**：DMG 使用 ad-hoc 签名（未经过 Apple 公证）。
+          > 首次打开时若提示「无法验证开发者」，请右键点击 App → 选择"打开"，
+          > 或执行：\`xattr -cr /Applications/rssh.app\`
+          BODYEOF
+
+          # ═══ 更新 Release ═══
+          gh release edit "$TAG" \
+            --repo "$REPO" \
+            --title "RSSH ${TAG} (Auto Build)" \
+            --notes-file /tmp/release_body.md
+
+          # ═══ 上传源码包 ═══
+          gh release upload "$TAG" \
+            --repo "$REPO" \
+            --clobber \
+            "rssh-${VERSION}-source.tar.gz"
+
+          echo "::notice::Release ${TAG} 描述已更新，源码包已上传。"
+
