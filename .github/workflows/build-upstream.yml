@@ -93,7 +93,7 @@ jobs:
           sudo apt-get install -y \
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev \
-            xdg-utils
+            libudev-dev xdg-utils
 
       - name: 前端测试 (vitest)
         run: npm test
@@ -205,7 +205,7 @@ jobs:
           sudo apt-get install -y \
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev \
-            xdg-utils
+            libudev-dev xdg-utils
 
       - name: 同步版本号
         shell: bash
@@ -552,4 +552,5 @@ jobs:
             "rssh-${VERSION}-source.tar.gz"
 
           echo "::notice::Release ${TAG} 描述已更新，源码包已上传。"
+
 
