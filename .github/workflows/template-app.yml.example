@@ -1,0 +1,106 @@
+# 模板：新增应用自动编译打包 Workflow
+# 将此文件复制为 build-[app_name].yml 即可快速接入新应用
+
+name: Example App Auto Build & Release
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # 每天北京时间 03:00 自动检测
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '强制编译指定的 Tag 版本 (例: v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      latest_tag: ${{ steps.compare.outputs.latest_tag }}
+    steps:
+      - name: 获取上游最新 Tag 并对比本地 Release
+        id: compare
+        run: |
+          # 1. 替换为目标上游仓库 (例如 owner/repo)
+          UPSTREAM_REPO="owner/target-repo"
+          
+          UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
+          if [ -z "$UPSTREAM_TAG" ]; then
+            UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/${UPSTREAM_REPO}/tags | grep '"name":' | head -n 1 | sed -E 's/.*"name": "([^"]+)".*/\1/')
+          fi
+
+          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
+            echo "has_new_version=true" >> $GITHUB_OUTPUT
+            echo "latest_tag=${{ github.event.inputs.force_tag }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MY_TAG=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' || echo "")
+
+          if [ "$UPSTREAM_TAG" != "$MY_TAG" ] && [ -n "$UPSTREAM_TAG" ]; then
+            echo "has_new_version=true" >> $GITHUB_OUTPUT
+            echo "latest_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "has_new_version=false" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build Application
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-latest # 根据需求配置矩阵 (ubuntu-latest / windows-latest / macos-latest)
+
+    steps:
+      # 适配点 1: 从上游仓库 checkout 源码并存入子目录 app-src
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: 'owner/target-repo'
+          ref: ${{ needs.check-version.outputs.latest_tag }}
+          path: 'app-src'
+
+      # 适配点 2: 保持上游原有的 Build Setup Steps（以下为示例，从上游 workflow 直接复制）
+      # - uses: actions/setup-node@v4 ...
+      # - uses: dtolnay/rust-toolchain@stable ...
+      # - uses: actions/setup-go@v5 ...
+
+      # 适配点 3: 加上 working-directory: ./app-src 运行上游编译脚本
+      - name: Build
+        working-directory: ./app-src
+        run: |
+          echo "在此处粘贴上游项目的编译与打包脚本"
+
+      # 上传编译产物并发布 Release
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-dist
+          path: app-src/dist/*
+          retention-days: 1
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, build]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.latest_tag }}
+          name: Release ${{ needs.check-version.outputs.latest_tag }}
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

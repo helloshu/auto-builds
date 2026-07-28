@@ -1,0 +1,12 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+artifacts/
+*.log
+
+# Node & Rust temporary
+node_modules/
+target/

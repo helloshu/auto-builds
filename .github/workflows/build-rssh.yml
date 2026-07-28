@@ -1,0 +1,462 @@
+name: RSSH Auto Build
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # 每天北京时间 03:00 自动检测
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新编译 (跳过已发布检查)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check_release.outputs.skip }}
+      tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: 获取上游最新 Tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(curl -sS --retry 3 --retry-delay 5 \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/shihuili1218/rssh/releases/latest \
+            | jq -r '.tag_name // empty')
+
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            LATEST_TAG=$(curl -sS --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/shihuili1218/rssh/tags \
+              | jq -r '.[].name' | grep -E '^v?[0-9]+\.' | sort -V | tail -n 1)
+          fi
+
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::error::无法获取上游最新 Tag"
+            exit 1
+          fi
+
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "检测到上游最新版本: $LATEST_TAG"
+
+      - name: 检查本仓库是否已发布该版本
+        id: check_release
+        run: |
+          if [ "${{ github.event.inputs.force }}" == "true" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          status=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.get_tag.outputs.tag }}")
+          if [ "$status" -eq 200 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Tests (对齐上游 release.yml) ──────────────────────────────
+  test:
+    needs: check-update
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.tag }}
+          path: app-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app-src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./app-src
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-src/src-tauri
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libudev-dev
+
+      - name: Frontend tests (vitest)
+        working-directory: ./app-src
+        run: npm test
+
+      - name: Backend tests (cargo)
+        working-directory: ./app-src/src-tauri
+        run: cargo test
+
+  # ── Desktop (对齐上游 release.yml) ────────────────────────────
+  build-desktop:
+    needs: [check-update, test]
+    if: needs.check-update.outputs.skip == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            os_name: macos
+            arch: aarch64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            os_name: macos
+            arch: x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            os_name: linux
+            arch: x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            os_name: windows
+            arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.tag }}
+          path: app-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app-src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./app-src
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-src/src-tauri
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libudev-dev
+
+      - name: Sync version from tag
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+          cd src-tauri
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Stage CLI for bundling
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          cd src-tauri
+          cargo build --release --features cli --bin rssh-cli --target ${{ matrix.target }}
+          mkdir -p bin
+          NAME="rssh-cli"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then NAME="rssh-cli.exe"; fi
+          cp "target/${{ matrix.target }}/release/${NAME}" bin/
+
+      - name: Build Tauri app
+        working-directory: ./app-src
+        run: npx tauri build --target ${{ matrix.target }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+
+      - name: Rename artifacts
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          PREFIX="rssh-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch }}"
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p dist
+
+          for f in "${BUNDLE}"/dmg/*.dmg;            do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.dmg";       done
+          for f in "${BUNDLE}"/deb/*.deb;             do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.deb";       done
+          for f in "${BUNDLE}"/rpm/*.rpm;              do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.rpm";       done
+          for f in "${BUNDLE}"/appimage/*.AppImage;    do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.AppImage";  done
+          for f in "${BUNDLE}"/msi/*.msi;              do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.msi";       done
+          for f in "${BUNDLE}"/nsis/*-setup.exe;       do [ -f "$f" ] && cp "$f" "dist/${PREFIX}-setup.exe"; done
+
+          ls -lh dist/
+
+      - name: Archive source code
+        if: matrix.os_name == 'linux'
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          SRC_NAME="rssh-${VERSION}-source"
+          mkdir -p "dist/${SRC_NAME}"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='src-tauri/target' \
+            --exclude='node_modules' \
+            --exclude='dist' \
+            ./ "dist/${SRC_NAME}/"
+          cd dist
+          tar czf "rssh-${VERSION}-source.tar.gz" "${SRC_NAME}"
+          rm -rf "${SRC_NAME}"
+
+      - name: Build Windows portable zip
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          PORTABLE="rssh-${VERSION}-windows-x86_64-portable"
+          REL="src-tauri/target/${{ matrix.target }}/release"
+          mkdir -p "${PORTABLE}"
+          cp "${REL}/rssh.exe" "${PORTABLE}/"
+          cp "${REL}/rssh-cli.exe" "${PORTABLE}/"
+          cat > "${PORTABLE}/README.txt" <<'EOF'
+          RSSH portable for Windows x86_64
+          --------------------------------
+          Just unzip and run rssh.exe — no installation needed.
+          rssh-cli.exe is the CLI binary; add this folder to PATH if you want
+          to use `rssh` from any terminal.
+          EOF
+          7z a "dist/${PORTABLE}.zip" "${PORTABLE}/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: app-src/dist/*
+          retention-days: 1
+
+  # ── Android (对齐上游 release.yml) ──────────────────────────────
+  build-android:
+    needs: [check-update, test]
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.tag }}
+          path: app-src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app-src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./app-src
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-src/src-tauri
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Point NDK_HOME at the runner NDK
+        run: echo "NDK_HOME=${ANDROID_NDK_LATEST_HOME:?NDK not found on runner}" >> "$GITHUB_ENV"
+
+      - name: Install Android targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi
+
+      - name: Sync version from tag
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+          cd src-tauri
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" tauri.conf.json
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Setup Android Signing
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "使用自定义 Secret 签名..."
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/gen/android/release.jks
+            printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+              "${{ secrets.ANDROID_KEY_ALIAS }}" \
+              "${{ secrets.ANDROID_KEY_PASSWORD }}" \
+              > src-tauri/gen/android/key.properties
+          else
+            echo "未配置密钥 Secret，自动现场生成通用自签名签名库..."
+            keytool -genkey -v -keystore src-tauri/gen/android/release.jks -alias androidkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AutoBuild, OU=Dev, O=AutoBuild, L=City, ST=State, C=US" -storepass android -keypass android
+            printf 'storeFile=release.jks\nstorePassword=android\nkeyAlias=androidkey\nkeyPassword=android\n' > src-tauri/gen/android/key.properties
+          fi
+
+      - name: Build Android APK
+        working-directory: ./app-src
+        run: npx tauri android build --apk
+
+      - name: Rename APK
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f | head -1)
+          if [ -n "$APK" ]; then
+            cp "$APK" "dist/rssh-${VERSION}-android-universal.apk"
+          fi
+          ls -lh dist/
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifact
+          path: app-src/dist/*.apk
+          retention-days: 1
+
+  # ── iOS (无签名 IPA 侧载打包) ──────────────────────────────
+  build-ios:
+    needs: [check-update, test]
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.tag }}
+          path: app-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app-src/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./app-src
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-src/src-tauri
+
+      - name: Install iOS build tools
+        shell: bash
+        run: |
+          command -v pod >/dev/null || brew install cocoapods
+          command -v xcodegen >/dev/null || brew install xcodegen
+
+      - name: Sync version from tag
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
+
+      - name: Build Unsigned iOS App & Package IPA
+        shell: bash
+        working-directory: ./app-src
+        run: |
+          TAG="${{ needs.check-update.outputs.tag }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist/Payload
+
+          # 1. 初始化生成 iOS Xcode 项目工程结构
+          npx tauri ios init
+
+          # 2. 导出关闭签名环境变量
+          export CODE_SIGN_IDENTITY=""
+          export CODE_SIGNING_REQUIRED=NO
+          export CODE_SIGNING_ALLOWED=NO
+
+          # 3. 指定 aarch64-sim 避开真机 SDK 强行要求付费 Team ID 的签名卡关
+          npx tauri ios build --target aarch64-sim -- --no-bundle || npx tauri ios build --target aarch64-sim || true
+
+          APP_PATH=$(find src-tauri/gen/apple/build -type d -name "*.app" 2>/dev/null | head -n 1)
+          if [ -n "$APP_PATH" ]; then
+            echo "找到 iOS 应用包: $APP_PATH ，开始压缩为无签名 IPA..."
+            cp -r "$APP_PATH" dist/Payload/
+            cd dist
+            zip -qr "rssh-${VERSION}-ios-unsigned.ipa" Payload
+            rm -rf Payload
+            echo "IPA 导出完成: dist/rssh-${VERSION}-ios-unsigned.ipa"
+            ls -lh .
+          else
+            echo "::error::未找到 iOS .app 目录"
+            exit 1
+          fi
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-artifact
+          path: app-src/dist/*.ipa
+          retention-days: 1
+
+  # ── Release 汇总发布 ──────────────────────────────────────────────
+  create-release:
+    needs: [check-update, build-desktop, build-android, build-ios]
+    if: always() && needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-update.outputs.tag }}
+          name: "RSSH ${{ needs.check-update.outputs.tag }}"
+          draft: false
+          prerelease: false
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
