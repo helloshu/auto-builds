@@ -2,7 +2,7 @@ name: RSSH Auto Build
 
 on:
   schedule:
-    - cron: '0 19 * * *' # 每天北京时间 03:00 自动检测
+    - cron: '17 19 * * *' # 每天北京时间 03:17，避开整点高峰
   workflow_dispatch:
     inputs:
       force:
@@ -12,67 +12,158 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: auto-build-rssh
+  cancel-in-progress: false
 
 jobs:
   check-update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       skip: ${{ steps.check_release.outputs.skip }}
       tag: ${{ steps.get_tag.outputs.tag }}
+      upstream_sha: ${{ steps.get_tag.outputs.upstream_sha }}
+      release_tag: ${{ steps.get_tag.outputs.release_tag }}
     steps:
-      - name: 获取上游最新 Tag
+      - name: 获取上游最新 Tag 和固定提交
         id: get_tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: shihuili1218/rssh
         run: |
-          LATEST_TAG=$(curl -sS --retry 3 --retry-delay 5 \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/shihuili1218/rssh/releases/latest \
-            | jq -r '.tag_name // empty')
+          set -euo pipefail
+          LATEST_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)
 
-          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-            LATEST_TAG=$(curl -sS --retry 3 --retry-delay 5 \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              https://api.github.com/repos/shihuili1218/rssh/tags \
-              | jq -r '.[].name' | grep -E '^v?[0-9]+\.' | sort -V | tail -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1)
           fi
 
-          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-            echo "::error::无法获取上游最新 Tag"
+          LATEST_TAG="${LATEST_TAG#refs/tags/}"
+          if [ -z "$LATEST_TAG" ] || ! git check-ref-format "refs/tags/${LATEST_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${LATEST_TAG:-<empty>}"
             exit 1
           fi
 
-          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "检测到上游最新版本: $LATEST_TAG"
+          ENCODED_TAG=$(jq -rn --arg value "$LATEST_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${LATEST_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="rssh-${LATEST_TAG}"
+          {
+            echo "tag=$LATEST_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "检测到上游版本 ${LATEST_TAG}，固定提交 ${UPSTREAM_SHA}"
 
       - name: 检查本仓库是否已发布该版本
         id: check_release
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.get_tag.outputs.release_tag }}
         run: |
-          if [ "${{ github.event.inputs.force }}" == "true" ]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [ "$FORCE" = true ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          status=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.get_tag.outputs.tag }}")
-          if [ "$status" -eq 200 ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-          else
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
 
-  # ── Tests (对齐上游 release.yml) ──────────────────────────────
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  validate-android-signing:
+    name: Validate Android release signing secrets
+    needs: check-update
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require a persistent Android signing identity
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::缺少必需的 Android 签名 Secret: $name"
+              exit 1
+            fi
+          done
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-update
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: shihuili1218/rssh
+          ref: ${{ needs.check-update.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="rssh-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-rssh
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
   test:
     needs: check-update
     if: needs.check-update.outputs.skip == 'false'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: shihuili1218/rssh
-          ref: ${{ needs.check-update.outputs.tag }}
+          ref: ${{ needs.check-update.outputs.upstream_sha }}
           path: app-src
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -82,9 +173,9 @@ jobs:
         working-directory: ./app-src
         run: npm ci
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: app-src/src-tauri
 
@@ -95,15 +186,14 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev libudev-dev
 
-      - name: Frontend tests (vitest)
+      - name: Frontend tests
         working-directory: ./app-src
         run: npm test
 
-      - name: Backend tests (cargo)
+      - name: Backend tests
         working-directory: ./app-src/src-tauri
         run: cargo test
 
-  # ── Desktop (对齐上游 release.yml) ────────────────────────────
   build-desktop:
     needs: [check-update, test]
     if: needs.check-update.outputs.skip == 'false'
@@ -111,11 +201,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             os_name: macos
             arch: aarch64
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             os_name: macos
             arch: x86_64
@@ -123,20 +213,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             os_name: linux
             arch: x86_64
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             os_name: windows
             arch: x86_64
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: shihuili1218/rssh
-          ref: ${{ needs.check-update.outputs.tag }}
+          ref: ${{ needs.check-update.outputs.upstream_sha }}
           path: app-src
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -146,11 +238,11 @@ jobs:
         working-directory: ./app-src
         run: npm ci
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: app-src/src-tauri
 
@@ -165,24 +257,28 @@ jobs:
       - name: Sync version from tag
         shell: bash
         working-directory: ./app-src
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          npm version "${VERSION}" --no-git-tag-version --allow-same-version
-          cd src-tauri
-          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" tauri.conf.json
-          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
 
       - name: Stage CLI for bundling
         shell: bash
         working-directory: ./app-src
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cd src-tauri
-          cargo build --release --features cli --bin rssh-cli --target ${{ matrix.target }}
-          mkdir -p bin
-          NAME="rssh-cli"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then NAME="rssh-cli.exe"; fi
-          cp "target/${{ matrix.target }}/release/${NAME}" bin/
+          set -euo pipefail
+          cargo build --manifest-path src-tauri/Cargo.toml --release --features cli --bin rssh-cli --target "$TARGET"
+          mkdir -p src-tauri/bin
+          NAME=rssh-cli
+          if [[ "$TARGET" == *windows* ]]; then NAME=rssh-cli.exe; fi
+          cp "src-tauri/target/${TARGET}/release/${NAME}" src-tauri/bin/
 
       - name: Build Tauri app
         working-directory: ./app-src
@@ -190,90 +286,206 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
 
-      - name: Rename artifacts
+      - name: Fix and verify AppImage icon symlink
+        if: runner.os == 'Linux'
         shell: bash
         working-directory: ./app-src
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          PREFIX="rssh-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch }}"
-          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
-          mkdir -p dist
+          set -euo pipefail
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle/appimage"
+          APPIMAGES=()
+          while IFS= read -r appimage; do
+            APPIMAGES+=("$appimage")
+          done < <(find "$BUNDLE" -maxdepth 1 -type f -name '*.AppImage' -print)
+          if [ "${#APPIMAGES[@]}" -ne 1 ]; then
+            echo "::error::预期 1 个 AppImage，实际 ${#APPIMAGES[@]} 个"
+            exit 1
+          fi
 
-          for f in "${BUNDLE}"/dmg/*.dmg;            do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.dmg";       done
-          for f in "${BUNDLE}"/deb/*.deb;             do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.deb";       done
-          for f in "${BUNDLE}"/rpm/*.rpm;              do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.rpm";       done
-          for f in "${BUNDLE}"/appimage/*.AppImage;    do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.AppImage";  done
-          for f in "${BUNDLE}"/msi/*.msi;              do [ -f "$f" ] && cp "$f" "dist/${PREFIX}.msi";       done
-          for f in "${BUNDLE}"/nsis/*-setup.exe;       do [ -f "$f" ] && cp "$f" "dist/${PREFIX}-setup.exe"; done
+          APPIMAGE=$(realpath "${APPIMAGES[0]}")
+          APPIMAGETOOL="$HOME/.cache/tauri/appimagetool-x86_64.AppImage"
+          if [ ! -x "$APPIMAGETOOL" ]; then
+            echo "::error::Tauri 缓存中缺少 appimagetool，拒绝下载未校验的 continuous 构建"
+            exit 1
+          fi
+          APPIMAGETOOL=$(realpath "$APPIMAGETOOL")
 
-          ls -lh dist/
+          cd "$(dirname "$APPIMAGE")"
+          BASE=$(basename "$APPIMAGE")
+          rm -rf squashfs-root
+          "./$BASE" --appimage-extract >/dev/null
+          if [ -L squashfs-root/.DirIcon ]; then
+            ln -sf "$(basename "$(readlink squashfs-root/.DirIcon)")" squashfs-root/.DirIcon
+          fi
+          ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run squashfs-root "$BASE"
+          rm -rf squashfs-root
 
-      - name: Archive source code
-        if: matrix.os_name == 'linux'
+          "./$BASE" --appimage-extract >/dev/null
+          ICON_TARGET=$(readlink squashfs-root/.DirIcon || true)
+          if [ -z "$ICON_TARGET" ] || [[ "$ICON_TARGET" = /* ]]; then
+            echo "::error::AppImage .DirIcon 仍不是有效的相对软链接"
+            exit 1
+          fi
+          rm -rf squashfs-root
+
+      - name: Collect and verify desktop artifacts
         shell: bash
         working-directory: ./app-src
+        env:
+          ARCH: ${{ matrix.arch }}
+          OS_NAME: ${{ matrix.os_name }}
+          TARGET: ${{ matrix.target }}
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          SRC_NAME="rssh-${VERSION}-source"
-          mkdir -p "dist/${SRC_NAME}"
-          rsync -a \
-            --exclude='.git' \
-            --exclude='src-tauri/target' \
-            --exclude='node_modules' \
-            --exclude='dist' \
-            ./ "dist/${SRC_NAME}/"
-          cd dist
-          tar czf "rssh-${VERSION}-source.tar.gz" "${SRC_NAME}"
-          rm -rf "${SRC_NAME}"
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          PREFIX="rssh-${VERSION}-${OS_NAME}-${ARCH}"
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+          mkdir -p release-assets
+
+          copy_one() {
+            local pattern=$1
+            local destination=$2
+            local matches=()
+            while IFS= read -r match; do
+              matches+=("$match")
+            done < <(compgen -G "$pattern" || true)
+            if [ "${#matches[@]}" -ne 1 ] || [ ! -s "${matches[0]}" ]; then
+              echo "::error::模式 $pattern 应匹配唯一的非空产物，实际匹配 ${#matches[@]} 个"
+              exit 1
+            fi
+            cp "${matches[0]}" "release-assets/$destination"
+          }
+
+          case "$OS_NAME" in
+            macos)
+              copy_one "${BUNDLE}/dmg/*.dmg" "${PREFIX}.dmg"
+              ;;
+            linux)
+              copy_one "${BUNDLE}/deb/*.deb" "${PREFIX}.deb"
+              copy_one "${BUNDLE}/rpm/*.rpm" "${PREFIX}.rpm"
+              copy_one "${BUNDLE}/appimage/*.AppImage" "${PREFIX}.AppImage"
+              ;;
+            windows)
+              copy_one "${BUNDLE}/msi/*.msi" "${PREFIX}.msi"
+              copy_one "${BUNDLE}/nsis/*-setup.exe" "${PREFIX}-setup.exe"
+              ;;
+            *)
+              echo "::error::未知桌面平台: $OS_NAME"
+              exit 1
+              ;;
+          esac
 
       - name: Build Windows portable zip
         if: runner.os == 'Windows'
         shell: bash
         working-directory: ./app-src
+        env:
+          TARGET: ${{ matrix.target }}
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
           PORTABLE="rssh-${VERSION}-windows-x86_64-portable"
-          REL="src-tauri/target/${{ matrix.target }}/release"
-          mkdir -p "${PORTABLE}"
-          cp "${REL}/rssh.exe" "${PORTABLE}/"
-          cp "${REL}/rssh-cli.exe" "${PORTABLE}/"
-          cat > "${PORTABLE}/README.txt" <<'EOF'
+          REL="src-tauri/target/${TARGET}/release"
+          mkdir -p "$PORTABLE"
+          cp "${REL}/rssh.exe" "$PORTABLE/"
+          cp "${REL}/rssh-cli.exe" "$PORTABLE/"
+          cat > "$PORTABLE/README.txt" <<'EOF'
           RSSH portable for Windows x86_64
           --------------------------------
-          Just unzip and run rssh.exe — no installation needed.
-          rssh-cli.exe is the CLI binary; add this folder to PATH if you want
-          to use `rssh` from any terminal.
+          Unzip and run rssh.exe. rssh-cli.exe is the CLI binary.
+          WebView2 Runtime is required. User data remains under %USERPROFILE%\.rssh.
           EOF
-          7z a "dist/${PORTABLE}.zip" "${PORTABLE}/"
+          7z a "release-assets/${PORTABLE}.zip" "$PORTABLE/"
+          test -s "release-assets/${PORTABLE}.zip"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Setup JDK 21 for JetBrains plugin
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build rssh-server for JetBrains plugin
+        shell: bash
+        working-directory: ./app-src/src-tauri
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --features server --bin rssh-server --target "$TARGET"
+
+      - name: Build and collect JetBrains plugin
+        shell: bash
+        working-directory: ./app-src
+        env:
+          ARCH: ${{ matrix.arch }}
+          OS_NAME: ${{ matrix.os_name }}
+          TARGET: ${{ matrix.target }}
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          BIN=rssh-server
+          if [[ "$TARGET" == *windows* ]]; then BIN=rssh-server.exe; fi
+          SERVER="$PWD/src-tauri/target/${TARGET}/release/${BIN}"
+          if [ ! -s "$SERVER" ]; then
+            echo "::error::缺少 JetBrains 插件所需的 rssh-server: $SERVER"
+            exit 1
+          fi
+
+          chmod +x idea-plugin/gradlew
+          (
+            cd idea-plugin
+            ./gradlew --no-daemon clean buildPlugin \
+              -PrsshIdeVersion=2024.2 \
+              -PrsshServerBin="$SERVER" \
+              -PpluginVersion="$VERSION"
+          )
+
+          PLUGINS=()
+          while IFS= read -r plugin; do
+            PLUGINS+=("$plugin")
+          done < <(find idea-plugin/build/distributions -maxdepth 1 -type f -name '*.zip' -print)
+          if [ "${#PLUGINS[@]}" -ne 1 ] || [ ! -s "${PLUGINS[0]:-}" ]; then
+            echo "::error::预期唯一的 JetBrains 插件压缩包，实际 ${#PLUGINS[@]} 个"
+            exit 1
+          fi
+
+          mkdir -p release-assets
+          OUTPUT="release-assets/rssh-${VERSION}-${OS_NAME}-${ARCH}-jetbrains-plugin.zip"
+          cp "${PLUGINS[0]}" "$OUTPUT"
+          test -s "$OUTPUT"
+
+      - name: Upload verified desktop artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: desktop-${{ matrix.os_name }}-${{ matrix.arch }}
-          path: app-src/dist/*
-          retention-days: 1
+          path: app-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
 
-  # ── Android (对齐上游 release.yml) ──────────────────────────────
   build-android:
-    needs: [check-update, test]
+    needs: [check-update, test, validate-android-signing]
     if: needs.check-update.outputs.skip == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: shihuili1218/rssh
-          ref: ${{ needs.check-update.outputs.tag }}
+          ref: ${{ needs.check-update.outputs.upstream_sha }}
           path: app-src
+          persist-credentials: false
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: 17
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -283,89 +495,168 @@ jobs:
         working-directory: ./app-src
         run: npm ci
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: app-src/src-tauri
 
-      - name: Setup Android SDK & NDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK and NDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
-      - name: Point NDK_HOME at the runner NDK
-        run: echo "NDK_HOME=${ANDROID_NDK_LATEST_HOME:?NDK not found on runner}" >> "$GITHUB_ENV"
-
-      - name: Install Android targets
-        run: rustup target add aarch64-linux-android armv7-linux-androideabi
+      - name: Configure Android build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "NDK_HOME=${ANDROID_NDK_LATEST_HOME:?NDK not found on runner}" >> "$GITHUB_ENV"
+          rustup target add aarch64-linux-android armv7-linux-androideabi
 
       - name: Sync version from tag
         shell: bash
         working-directory: ./app-src
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          npm version "${VERSION}" --no-git-tag-version --allow-same-version
-          cd src-tauri
-          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" tauri.conf.json
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
 
-      - name: Setup Android Signing
+      - name: Disable Gradle signing for isolated release signing
         shell: bash
         working-directory: ./app-src
         run: |
-          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
-            echo "使用自定义 Secret 签名..."
-            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > src-tauri/gen/android/release.jks
-            printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-              "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
-              "${{ secrets.ANDROID_KEY_ALIAS }}" \
-              "${{ secrets.ANDROID_KEY_PASSWORD }}" \
-              > src-tauri/gen/android/key.properties
-          else
-            echo "未配置密钥 Secret，自动现场生成通用自签名签名库..."
-            keytool -genkey -v -keystore src-tauri/gen/android/release.jks -alias androidkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AutoBuild, OU=Dev, O=AutoBuild, L=City, ST=State, C=US" -storepass android -keypass android
-            printf 'storeFile=release.jks\nstorePassword=android\nkeyAlias=androidkey\nkeyPassword=android\n' > src-tauri/gen/android/key.properties
+          set -euo pipefail
+          GRADLE_FILE=src-tauri/gen/android/app/build.gradle.kts
+          SIGNING_LINE='signingConfig = signingConfigs.getByName("release")'
+          if ! grep -Fq "$SIGNING_LINE" "$GRADLE_FILE"; then
+            echo "::error::无法定位 Android release 签名绑定，上游 Gradle 配置可能已变化"
+            exit 1
           fi
+          sed -i.bak "/signingConfig = signingConfigs.getByName(\"release\")/d" "$GRADLE_FILE"
+          rm -f "${GRADLE_FILE}.bak"
 
-      - name: Build Android APK
+      - name: Build Android universal APK
         working-directory: ./app-src
-        run: npx tauri android build --apk
+        run: npx tauri android build --apk --target aarch64 armv7 --ci
 
-      - name: Rename APK
+      - name: Collect and verify unsigned Android signing input
         shell: bash
         working-directory: ./app-src
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          mkdir -p dist
-          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f | head -1)
-          if [ -n "$APK" ]; then
-            cp "$APK" "dist/rssh-${VERSION}-android-universal.apk"
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          APK=src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          if [ ! -s "$APK" ]; then
+            echo "::error::缺少预期的未签名 universal release APK: $APK"
+            exit 1
           fi
-          ls -lh dist/
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          test -x "$APKSIGNER"
+          if "$APKSIGNER" verify "$APK" >/dev/null 2>&1; then
+            echo "::error::Android 签名输入不应包含任何签名"
+            exit 1
+          fi
+          mkdir -p android-build-input
+          cp "$APK" "android-build-input/rssh-${VERSION}-android-build-input.apk"
 
-      - name: Upload Android artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Android signing input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: android-artifact
-          path: app-src/dist/*.apk
+          name: android-build-input
+          path: app-src/android-build-input/*.apk
+          if-no-files-found: error
           retention-days: 1
 
-  # ── iOS (无签名 IPA 侧载打包) ──────────────────────────────
+  sign-android:
+    name: Sign Android APK in isolated job
+    needs: [check-update, build-android]
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android build tools
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Download Android signing input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-build-input
+          path: android-input
+
+      - name: Sign and verify release APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          INPUT="android-input/rssh-${VERSION}-android-build-input.apk"
+          test -s "$INPUT"
+
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+
+          SIGNING_DIR=$(mktemp -d)
+          trap 'rm -rf "$SIGNING_DIR"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$SIGNING_DIR/release.jks"
+          "$ZIPALIGN" -f -p 4 "$INPUT" "$SIGNING_DIR/aligned.apk"
+
+          mkdir -p release-assets
+          OUTPUT="release-assets/rssh-${VERSION}-android-universal.apk"
+          "$APKSIGNER" sign \
+            --ks "$SIGNING_DIR/release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$OUTPUT" \
+            "$SIGNING_DIR/aligned.apk"
+          "$APKSIGNER" verify --verbose --print-certs "$OUTPUT"
+          test -s "$OUTPUT"
+
+      - name: Upload signed Android artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-artifact
+          path: release-assets/*.apk
+          if-no-files-found: error
+          retention-days: 5
+
   build-ios:
+    name: Build unsigned iPhoneOS arm64 IPA
     needs: [check-update, test]
     if: needs.check-update.outputs.skip == 'false'
-    runs-on: macos-latest
+    runs-on: macos-15
+    env:
+      CI: true
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: shihuili1218/rssh
-          ref: ${{ needs.check-update.outputs.tag }}
+          ref: ${{ needs.check-update.outputs.upstream_sha }}
           path: app-src
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
@@ -375,88 +666,254 @@ jobs:
         working-directory: ./app-src
         run: npm ci
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: aarch64-apple-ios
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: app-src/src-tauri
 
       - name: Install iOS build tools
         shell: bash
         run: |
+          set -euo pipefail
           command -v pod >/dev/null || brew install cocoapods
           command -v xcodegen >/dev/null || brew install xcodegen
+          xcrun --sdk iphoneos --show-sdk-path >/dev/null
 
       - name: Sync version from tag
         shell: bash
         working-directory: ./app-src
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::iOS 版本号必须是 x.y.z，实际为 $VERSION"
+            exit 1
+          fi
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
-          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
           rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
 
-      - name: Build Unsigned iOS App & Package IPA
+      - name: Initialize and repair Tauri iOS project
         shell: bash
         working-directory: ./app-src
         run: |
-          TAG="${{ needs.check-update.outputs.tag }}"
-          VERSION="${TAG#v}"
-          mkdir -p dist/Payload
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          if [ ! -f src-tauri/gen/apple/project.yml ]; then
+            npx tauri ios init --ci --skip-targets-install
+          fi
 
-          # 1. 初始化生成 iOS Xcode 项目工程结构
-          npx tauri ios init
+          PROJECT_YML=src-tauri/gen/apple/project.yml
+          if grep -q 'script: npm run -- tauri ios xcode-script' "$PROJECT_YML"; then
+            perl -0pi -e 's{script: npm run -- tauri ios xcode-script}{script: cd "\$\{SRCROOT\}/../../.." \&\& npm run -- tauri ios xcode-script}' "$PROJECT_YML"
+          fi
+          cp src-tauri/PrivacyInfo.xcprivacy src-tauri/gen/apple/rssh_iOS/PrivacyInfo.xcprivacy
+          xcodegen generate --spec "$PROJECT_YML" --project src-tauri/gen/apple
+          cp src-tauri/icons/ios/*.png src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/
+          npm run build
 
-          # 2. 导出关闭签名环境变量
-          export CODE_SIGN_IDENTITY=""
-          export CODE_SIGNING_REQUIRED=NO
-          export CODE_SIGNING_ALLOWED=NO
-
-          # 3. 指定 aarch64-sim 避开真机 SDK 强行要求付费 Team ID 的签名卡关
-          npx tauri ios build --target aarch64-sim -- --no-bundle || npx tauri ios build --target aarch64-sim || true
-
-          APP_PATH=$(find src-tauri/gen/apple/build -type d -name "*.app" 2>/dev/null | head -n 1)
-          if [ -n "$APP_PATH" ]; then
-            echo "找到 iOS 应用包: $APP_PATH ，开始压缩为无签名 IPA..."
-            cp -r "$APP_PATH" dist/Payload/
-            cd dist
-            zip -qr "rssh-${VERSION}-ios-unsigned.ipa" Payload
-            rm -rf Payload
-            echo "IPA 导出完成: dist/rssh-${VERSION}-ios-unsigned.ipa"
-            ls -lh .
-          else
-            echo "::error::未找到 iOS .app 目录"
+      - name: Build unsigned iPhoneOS arm64 app and package IPA
+        shell: bash
+        working-directory: ./app-src
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          PROJECT=$(find src-tauri/gen/apple -maxdepth 1 -type d -name '*.xcodeproj' -print -quit)
+          if [ -z "$PROJECT" ]; then
+            echo "::error::未找到生成的 Xcode 项目"
+            exit 1
+          fi
+          WORKSPACE="${PROJECT}/project.xcworkspace"
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json \
+            | jq -r '.workspace.schemes[] | select(endswith("_iOS"))' \
+            | head -n 1)
+          if [ -z "$SCHEME" ]; then
+            echo "::error::未找到 Tauri iOS scheme"
             exit 1
           fi
 
-      - name: Upload iOS artifact
-        uses: actions/upload-artifact@v4
+          DERIVED_DATA="$PWD/src-tauri/gen/apple/build-unsigned"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            PROVISIONING_PROFILE_SPECIFIER='' \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            build
+
+          PRODUCT_DIR="$DERIVED_DATA/Build/Products/release-iphoneos"
+          APPS=()
+          while IFS= read -r app; do
+            APPS+=("$app")
+          done < <(find "$PRODUCT_DIR" -maxdepth 1 -type d -name '*.app' -print)
+          if [ "${#APPS[@]}" -ne 1 ]; then
+            echo "::error::预期 1 个真机 .app，实际 ${#APPS[@]} 个"
+            exit 1
+          fi
+          APP_PATH="${APPS[0]}"
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
+          BINARY="$APP_PATH/$EXECUTABLE"
+          test -f "$BINARY"
+
+          if [ "$(lipo -archs "$BINARY")" != arm64 ]; then
+            echo "::error::iOS 可执行文件不是纯 arm64 真机架构"
+            exit 1
+          fi
+          if ! vtool -show-build "$BINARY" | grep -Eq 'platform +IOS$'; then
+            echo "::error::产物不是 iPhoneOS 真机二进制"
+            vtool -show-build "$BINARY"
+            exit 1
+          fi
+          if [ -d "$APP_PATH/_CodeSignature" ] || codesign --verify "$APP_PATH" 2>/dev/null; then
+            echo "::error::预期未签名应用，但检测到了代码签名"
+            exit 1
+          fi
+
+          mkdir -p release-assets/Payload
+          ditto "$APP_PATH" "release-assets/Payload/$(basename "$APP_PATH")"
+          (
+            cd release-assets
+            zip -qry "rssh-${VERSION}-ios-arm64-unsigned.ipa" Payload
+          )
+          rm -rf release-assets/Payload
+          unzip -t "release-assets/rssh-${VERSION}-ios-arm64-unsigned.ipa"
+          test -s "release-assets/rssh-${VERSION}-ios-arm64-unsigned.ipa"
+
+      - name: Upload unsigned iOS artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ios-artifact
-          path: app-src/dist/*.ipa
-          retention-days: 1
+          path: app-src/release-assets/*.ipa
+          if-no-files-found: error
+          retention-days: 5
 
-  # ── Release 汇总发布 ──────────────────────────────────────────────
   create-release:
-    needs: [check-update, build-desktop, build-android, build-ios]
-    if: always() && needs.check-update.outputs.skip == 'false'
-    runs-on: ubuntu-latest
+    needs: [check-update, archive-source, build-desktop, sign-android, build-ios]
+    if: needs.check-update.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          pattern: source-rssh
+          merge-multiple: true
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: desktop-*
+          merge-multiple: true
+
+      - name: Download signed Android artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: android-artifact
+          merge-multiple: true
+
+      - name: Download iOS artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: ios-artifact
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-update.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "rssh-${VERSION}-macos-aarch64.dmg"
+            "rssh-${VERSION}-macos-aarch64-jetbrains-plugin.zip"
+            "rssh-${VERSION}-macos-x86_64.dmg"
+            "rssh-${VERSION}-macos-x86_64-jetbrains-plugin.zip"
+            "rssh-${VERSION}-linux-x86_64.deb"
+            "rssh-${VERSION}-linux-x86_64.rpm"
+            "rssh-${VERSION}-linux-x86_64.AppImage"
+            "rssh-${VERSION}-linux-x86_64-jetbrains-plugin.zip"
+            "rssh-${VERSION}-windows-x86_64.msi"
+            "rssh-${VERSION}-windows-x86_64-setup.exe"
+            "rssh-${VERSION}-windows-x86_64-portable.zip"
+            "rssh-${VERSION}-windows-x86_64-jetbrains-plugin.zip"
+            "rssh-${VERSION}-android-universal.apk"
+            "rssh-${VERSION}-ios-arm64-unsigned.ipa"
+            "rssh-${VERSION}-source.tar.gz"
+          )
+
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ needs.check-update.outputs.tag }}
-          name: "RSSH ${{ needs.check-update.outputs.tag }}"
+          tag_name: ${{ needs.check-update.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: RSSH ${{ needs.check-update.outputs.tag }}
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated build of [shihuili1218/rssh ${{ needs.check-update.outputs.tag }}](https://github.com/shihuili1218/rssh/releases/tag/${{ needs.check-update.outputs.tag }}).
+
+            Upstream commit: `${{ needs.check-update.outputs.upstream_sha }}`
+            The iOS IPA contains an unsigned iPhoneOS arm64 app and must be signed before installation.
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
           files: artifacts/**/*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}

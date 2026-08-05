@@ -1,11 +1,11 @@
 # 模板：新增应用自动编译打包 Workflow
-# 将此文件复制为 build-[app_name].yml 即可快速接入新应用
+# 复制为 build-[app-name].yml 后，必须替换 APP_ID、UPSTREAM_REPO、构建步骤和产物清单。
 
 name: Example App Auto Build & Release
 
 on:
   schedule:
-    - cron: '0 19 * * *' # 每天北京时间 03:00 自动检测
+    - cron: '37 19 * * *' # 为每个应用选择不同分钟，避免整点拥堵
   workflow_dispatch:
     inputs:
       force_tag:
@@ -14,93 +14,224 @@ on:
         default: ''
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: auto-build-example-app
+  cancel-in-progress: false
 
 jobs:
   check-version:
     name: Check Version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       has_new_version: ${{ steps.compare.outputs.has_new_version }}
-      latest_tag: ${{ steps.compare.outputs.latest_tag }}
+      app_id: ${{ steps.compare.outputs.app_id }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
     steps:
-      - name: 获取上游最新 Tag 并对比本地 Release
+      - name: 获取上游最新 Tag 并检查本地 Release
         id: compare
+        shell: bash
+        env:
+          APP_ID: example-app
+          FORCE_TAG: ${{ inputs.force_tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: owner/target-repo
         run: |
-          # 1. 替换为目标上游仓库 (例如 owner/repo)
-          UPSTREAM_REPO="owner/target-repo"
-          
-          UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
-          if [ -z "$UPSTREAM_TAG" ]; then
-            UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/${UPSTREAM_REPO}/tags | grep '"name":' | head -n 1 | sed -E 's/.*"name": "([^"]+)".*/\1/')
+          set -euo pipefail
+          if [ -n "$FORCE_TAG" ]; then
+            UPSTREAM_TAG="$FORCE_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)
+            if [ -z "$UPSTREAM_TAG" ]; then
+              UPSTREAM_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+                | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1)
+            fi
           fi
 
-          if [ -n "${{ github.event.inputs.force_tag }}" ]; then
-            echo "has_new_version=true" >> $GITHUB_OUTPUT
-            echo "latest_tag=${{ github.event.inputs.force_tag }}" >> $GITHUB_OUTPUT
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "app_id=$APP_ID"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FORCE_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          MY_TAG=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' || echo "")
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
 
-          if [ "$UPSTREAM_TAG" != "$MY_TAG" ] && [ -n "$UPSTREAM_TAG" ]; then
-            echo "has_new_version=true" >> $GITHUB_OUTPUT
-            echo "latest_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
-          else
-            echo "has_new_version=false" >> $GITHUB_OUTPUT
-          fi
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: owner/target-repo
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          APP_ID: ${{ needs.check-version.outputs.app_id }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="${APP_ID}-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-${{ needs.check-version.outputs.app_id }}
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
 
   build:
     name: Build Application
     needs: check-version
     if: needs.check-version.outputs.has_new_version == 'true'
-    runs-on: ubuntu-latest # 根据需求配置矩阵 (ubuntu-latest / windows-latest / macos-latest)
-
+    runs-on: ubuntu-22.04 # 跨平台项目可改成矩阵；源码归档已独立，不依赖此 runner。
     steps:
-      # 适配点 1: 从上游仓库 checkout 源码并存入子目录 app-src
-      - name: Checkout upstream source
-        uses: actions/checkout@v4
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: 'owner/target-repo'
-          ref: ${{ needs.check-version.outputs.latest_tag }}
-          path: 'app-src'
+          repository: owner/target-repo
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
 
-      # 适配点 2: 保持上游原有的 Build Setup Steps（以下为示例，从上游 workflow 直接复制）
-      # - uses: actions/setup-node@v4 ...
-      # - uses: dtolnay/rust-toolchain@stable ...
-      # - uses: actions/setup-go@v5 ...
+      # 所有第三方 Action 都必须固定完整 SHA，例如：
+      # - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
 
-      # 适配点 3: 加上 working-directory: ./app-src 运行上游编译脚本
-      - name: Build
+      - name: Build and collect release assets
         working-directory: ./app-src
+        shell: bash
         run: |
-          echo "在此处粘贴上游项目的编译与打包脚本"
+          set -euo pipefail
+          # 在这里执行上游构建步骤。
+          # 最终只把需要发布的文件复制到独立的 release-assets/，不要上传 dist/*。
+          mkdir -p release-assets
+          echo "::error::请替换模板构建步骤，并把经过验证的产物放入 release-assets/"
+          exit 1
 
-      # 上传编译产物并发布 Release
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload verified build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: app-dist
-          path: app-src/dist/*
-          retention-days: 1
+          name: build-${{ needs.check-version.outputs.app_id }}
+          path: app-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
 
   create-release:
     name: Create GitHub Release
-    needs: [check-version, build]
+    needs: [check-version, archive-source, build]
     if: needs.check-version.outputs.has_new_version == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          merge-multiple: true
+
+      - name: Verify source and binary artifacts
+        shell: bash
+        env:
+          APP_ID: ${{ needs.check-version.outputs.app_id }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SOURCE_NAME="${APP_ID}-${VERSION}-source.tar.gz"
+          SOURCE_COUNT=$(find artifacts -type f -name "$SOURCE_NAME" | wc -l)
+          TOTAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$SOURCE_COUNT" -ne 1 ]; then
+            echo "::error::源码包 $SOURCE_NAME 的数量应为 1，实际为 $SOURCE_COUNT"
+            exit 1
+          fi
+          if [ "$TOTAL_COUNT" -lt 2 ]; then
+            echo "::error::除源码包外至少需要一个经过验证的二进制产物"
+            exit 1
+          fi
+          # 必须在这里为具体应用增加精确的文件名/架构清单验证。
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ needs.check-version.outputs.latest_tag }}
-          name: Release ${{ needs.check-version.outputs.latest_tag }}
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Example App ${{ needs.check-version.outputs.upstream_tag }}
+          fail_on_unmatched_files: true
+          body: |
+            Automated build of [owner/target-repo ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/owner/target-repo/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
           files: artifacts/**/*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
