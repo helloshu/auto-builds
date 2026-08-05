@@ -15,7 +15,7 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 
 ## 💡 Usage
 
-- **Scheduled Triggers**: Workflows use staggered daily schedules (FlowZ at 03:07 and RSSH at 03:17 CST) to avoid GitHub Actions' top-of-hour congestion.
+- **Scheduled Triggers**: Workflows use staggered daily schedules to avoid GitHub Actions' top-of-hour congestion.
 - **Manual Triggers**: Manually trigger builds on demand via the GitHub Actions UI with custom options (`force` re-builds or specific tags).
 - **Clean Source Archives**: Every Release includes an `[app]-[version]-source.tar.gz` created with `git archive` from the immutable upstream commit, without build outputs or modified files.
 - **Release Integrity**: Workflows validate an exact artifact manifest, generate `SHA256SUMS`, and publish GitHub build-provenance attestations before creating a Release.

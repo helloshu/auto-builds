@@ -15,7 +15,7 @@
 
 ## 💡 使用说明
 
-- **错峰定时触发**：工作流每天错峰检测上游版本（FlowZ 03:07、RSSH 03:17），避免 GitHub Actions 整点拥堵。
+- **错峰定时触发**：工作流每天错峰检测上游版本，避免 GitHub Actions 整点拥堵。
 - **手动触发**：可以在 GitHub Actions 页面选择具体的工作流手动点击 **Run workflow** 触发构建（可传入 `force` 重新编译或指定 `tag`）。
 - **干净源码归档**：每个 Release 都包含由固定上游提交通过 `git archive` 生成的 `[应用]-[版本]-source.tar.gz`，不会混入构建结果或构建时修改的文件。
 - **发布完整性**：创建 Release 前会核对精确产物清单、生成 `SHA256SUMS`，并发布 GitHub 构建来源证明。
