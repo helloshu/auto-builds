@@ -21,25 +21,6 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 - **Release Integrity**: Workflows validate an exact artifact manifest, generate `SHA256SUMS`, and publish GitHub build-provenance attestations before creating a Release.
 - **Least Privilege**: Build jobs are read-only, external checkouts do not persist credentials, and only the final release job receives write and attestation permissions.
 
-### Release Tag Convention
-
-Release tags use `<app-id>-<upstream-tag>`, for example:
-
-- FlowZ `v4.3.0` → `flowz-v4.3.0`
-- RSSH `v0.2.15` → `rssh-v0.2.15`
-
-Each workflow checks its exact release tag instead of relying on the repository-wide `releases/latest` endpoint. When adding an application, copy the [workflow template](.github/workflows/template-app.yml.example) and assign a unique lowercase `APP_ID`.
-
-### Gear Lever Updates
-
-GitHub exposes only one Latest Release per repository. When using this repository with Gear Lever, enable **Allow pre-releases** so it scans multiple releases, then use an app-specific filename pattern such as `FlowZ-*-linux-x86_64.AppImage` or `rssh-*-linux-x86_64.AppImage`.
-
-### RSSH Mobile and IDE Builds
-
-- Android Releases require one persistent signing identity. Configure `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` in repository Actions secrets. The production keystore is only used in an isolated signing job that does not checkout or execute upstream code.
-- The iOS artifact is an **unsigned iPhoneOS arm64 IPA**. It contains a device build rather than a simulator build, but it must be signed with your own certificate/provisioning method before installation.
-- JetBrains plugins are built separately for macOS aarch64, macOS x86_64, Linux x86_64, and Windows x86_64 because each plugin embeds the matching native `rssh-server` binary.
-
 ---
 
 ## 📄 License & Disclaimer
