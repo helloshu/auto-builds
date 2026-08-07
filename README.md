@@ -12,6 +12,8 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 | **FlowZ** | Electron Workflow Desktop Client | [dododook/FlowZ](https://github.com/dododook/FlowZ) | [`build-flowz.yml`](.github/workflows/build-flowz.yml) | ![FlowZ Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-flowz.yml/badge.svg) |
 | **MuffinStore** | iOS App Store downgrader / installer (TrollStore) | [mineek/MuffinStore](https://github.com/mineek/MuffinStore) | [`build-muffinstore.yml`](.github/workflows/build-muffinstore.yml) | ![MuffinStore Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-muffinstore.yml/badge.svg) |
 | **Geranium** | iOS LocSim, Daemon Manager, Cleaner & Superviser (TrollStore) | [c22dev/Geranium](https://github.com/c22dev/Geranium) | [`build-geranium.yml`](.github/workflows/build-geranium.yml) | ![Geranium Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-geranium.yml/badge.svg) |
+| **ChatGBeFree** | iOS jailbreak tweak — bypass ChatGPT forced sunset upgrade | [liamschwie/ChatGBeFree](https://github.com/liamschwie/ChatGBeFree) | [`build-chatgbefree.yml`](.github/workflows/build-chatgbefree.yml) | ![ChatGBeFree Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-chatgbefree.yml/badge.svg) |
+| **Asspp** | Swift multi-region App Store manager (iOS + macOS) | [Lakr233/Asspp](https://github.com/Lakr233/Asspp) | [`build-asspp.yml`](.github/workflows/build-asspp.yml) | ![Asspp Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-asspp.yml/badge.svg) |
 
 ---
 

@@ -1,12 +1,12 @@
-name: Geranium Auto Build
+name: ChatGBeFree Auto Build
 
 on:
   schedule:
-    - cron: '37 19 * * *' # 每天北京时间 03:37，避开整点高峰
+    - cron: '47 19 * * *' # 每天北京时间 03:47，避开整点高峰
   workflow_dispatch:
     inputs:
       force_tag:
-        description: '强制编译指定的 Tag 版本 (例如: 1.1.4)'
+        description: '强制编译指定的 Tag 版本 (例如: v1.0.0)'
         required: false
         default: ''
 
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: auto-build-geranium
+  group: auto-build-chatgbefree
   cancel-in-progress: false
 
 jobs:
@@ -32,10 +32,10 @@ jobs:
         id: compare
         shell: bash
         env:
-          APP_ID: geranium
+          APP_ID: chatgbefree
           FORCE_TAG: ${{ inputs.force_tag }}
           GH_TOKEN: ${{ github.token }}
-          UPSTREAM_REPO: c22dev/Geranium
+          UPSTREAM_REPO: liamschwie/ChatGBeFree
         run: |
           set -euo pipefail
           if [ -n "$FORCE_TAG" ]; then
@@ -99,7 +99,7 @@ jobs:
       - name: Checkout immutable upstream commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: c22dev/Geranium
+          repository: liamschwie/ChatGBeFree
           ref: ${{ needs.check-version.outputs.upstream_sha }}
           path: app-src
           persist-credentials: false
@@ -127,27 +127,26 @@ jobs:
           retention-days: 5
 
   build:
-    name: Build unsigned iOS arm64 TIPA
+    name: Build jailbreak tweak (rootless + rootful)
     needs: check-version
     if: needs.check-version.outputs.has_new_version == 'true'
     runs-on: macos-15
     steps:
-      - name: Checkout immutable upstream commit (with submodules)
+      - name: Checkout immutable upstream commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: c22dev/Geranium
+          repository: liamschwie/ChatGBeFree
           ref: ${{ needs.check-version.outputs.upstream_sha }}
           path: app-src
           persist-credentials: false
-          submodules: true
 
-      - name: Setup Theos (for RootHelper)
+      - name: Setup Theos
         uses: Randomblock1/theos-action@4e23d15886bca77b5f7c462a82567e0de33ebe0b # v1
         with:
           # Pin SDK download to immutable commit (2024-11-23) for supply-chain safety
           theos-sdks-branch: 0222fd5413cf4b9af096f37b4621afa2688572f7
 
-      - name: Build Geranium and package TIPA
+      - name: Build rootless and rootful .deb packages
         working-directory: ./app-src
         shell: bash
         env:
@@ -155,84 +154,30 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
-
-          # 1. Build the main app with Xcode (unsigned, for TrollStore)
-          xcodebuild \
-            -project Geranium.xcodeproj \
-            -scheme Geranium \
-            -configuration Release \
-            -derivedDataPath build/DerivedData \
-            -destination 'generic/platform=iOS' \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/Geranium.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "::error::未找到构建产物 $APP_PATH"
-            find build/DerivedData/Build/Products -type d -name '*.app' -print || true
-            exit 1
-          fi
-
-          # 2. Copy .app to working directory and strip signature
-          TARGET_APP="build/Geranium.app"
-          rm -rf "$TARGET_APP"
-          cp -r "$APP_PATH" "$TARGET_APP"
-          codesign --remove "$TARGET_APP" 2>/dev/null || true
-          rm -rf "$TARGET_APP/_CodeSignature" "$TARGET_APP/embedded.mobileprovision"
-
-          # 3. Build RootHelper with Theos
-          cd RootHelper
-          make clean
-          make
-          cp .theos/obj/debug/GeraniumRootHelper ../"$TARGET_APP/GeraniumRootHelper"
-          cd ..
-
-          # 4. Add entitlements with ldid
-          ldid -Sentitlements.plist "$TARGET_APP/Geranium"
-          APPEX_BIN="$TARGET_APP/PlugIns/Bookmark Location in Geranium.appex/Bookmark Location in Geranium"
-          if [ -f "$APPEX_BIN" ]; then
-            ldid -S"Bookmark Location in Geranium/entitlements.plist" "$APPEX_BIN"
-          fi
-
-          # 5. Package .tipa
-          rm -rf build/Payload
-          mkdir build/Payload
-          cp -r "$TARGET_APP" build/Payload/Geranium.app
-          (
-            cd build
-            zip -qry "Geranium-${VERSION}-ios-arm64.tipa" Payload
-          )
-          rm -rf build/Payload
-
-          # 6. Verify the TIPA
-          TIPA="release-assets/Geranium-${VERSION}-ios-arm64.tipa"
+          export THEOS_PACKAGE_BASE_VERSION="$VERSION"
           mkdir -p release-assets
-          cp "build/Geranium-${VERSION}-ios-arm64.tipa" "$TIPA"
 
-          TMPDIR=$(mktemp -d)
-          trap 'rm -rf "$TMPDIR"' EXIT
-          unzip -q "$TIPA" -d "$TMPDIR"
-          APP_PATH=$(find "$TMPDIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)
-          if [ -z "$APP_PATH" ]; then
-            echo "::error::TIPA 中未找到 .app"
+          # Build rootless (default scheme from Makefile)
+          FINALPACKAGE=1 make clean package
+          ROOTLESS_DEB=$(find packages -maxdepth 1 -type f -name '*.deb' -print -quit)
+          if [ -z "$ROOTLESS_DEB" ]; then
+            echo "::error::rootless 构建未产出 .deb"
             exit 1
           fi
-          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
-          BINARY="$APP_PATH/$EXECUTABLE"
-          test -f "$BINARY"
-          if [ "$(lipo -archs "$BINARY")" != "arm64" ]; then
-            echo "::error::iOS 可执行文件不是纯 arm64 真机架构"
+          cp "$ROOTLESS_DEB" "release-assets/ChatGBeFree-${VERSION}-rootless.deb"
+
+          # Build rootful (override THEOS_PACKAGE_SCHEME)
+          FINALPACKAGE=1 make clean package THEOS_PACKAGE_SCHEME=rootful
+          ROOTFUL_DEB=$(find packages -maxdepth 1 -type f -name '*.deb' -print -quit)
+          if [ -z "$ROOTFUL_DEB" ]; then
+            echo "::error::rootful 构建未产出 .deb"
             exit 1
           fi
-          if [ ! -f "$APP_PATH/GeraniumRootHelper" ]; then
-            echo "::error::缺少 GeraniumRootHelper 二进制"
-            exit 1
-          fi
-          if [ -d "$APP_PATH/_CodeSignature" ]; then
-            echo "::error::预期未签名应用，但检测到了 _CodeSignature"
-            exit 1
-          fi
+          cp "$ROOTFUL_DEB" "release-assets/ChatGBeFree-${VERSION}-rootful.deb"
+
+          # Verify both packages exist and are non-empty
+          test -s "release-assets/ChatGBeFree-${VERSION}-rootless.deb"
+          test -s "release-assets/ChatGBeFree-${VERSION}-rootful.deb"
 
       - name: Upload verified build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -267,7 +212,8 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           EXPECTED=(
-            "Geranium-${VERSION}-ios-arm64.tipa"
+            "ChatGBeFree-${VERSION}-rootless.deb"
+            "ChatGBeFree-${VERSION}-rootful.deb"
             "${APP_ID}-${VERSION}-source.tar.gz"
           )
           for name in "${EXPECTED[@]}"; do
@@ -307,17 +253,17 @@ jobs:
         with:
           tag_name: ${{ needs.check-version.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          name: Geranium ${{ needs.check-version.outputs.upstream_tag }}
+          name: ChatGBeFree ${{ needs.check-version.outputs.upstream_tag }}
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
           body: |
-            Automated build of [c22dev/Geranium ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/c22dev/Geranium/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+            Automated build of [liamschwie/ChatGBeFree ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/liamschwie/ChatGBeFree/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
 
             Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
             SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
 
-            This is an unsigned iOS TrollStore app (.tipa). Install via [TrollStore](https://github.com/opa334/TrollStore) on iOS 15.0+.
+            Includes both rootless (Dopamine, palera1n) and rootful jailbreak `.deb` packages.
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ github.token }}

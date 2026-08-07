@@ -142,6 +142,9 @@ jobs:
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@4e23d15886bca77b5f7c462a82567e0de33ebe0b # v1
+        with:
+          # Pin SDK download to immutable commit (2024-11-23) for supply-chain safety
+          theos-sdks-branch: 0222fd5413cf4b9af096f37b4621afa2688572f7
 
       - name: Build and package MuffinStore
         working-directory: ./app-src
