@@ -12,8 +12,6 @@
 | **FlowZ** | Electron 工作流桌面端 | [dododook/FlowZ](https://github.com/dododook/FlowZ) | [`build-flowz.yml`](.github/workflows/build-flowz.yml) | ![FlowZ Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-flowz.yml/badge.svg) |
 | **MuffinStore** | iOS App Store 降级 / 安装工具 (TrollStore) | [mineek/MuffinStore](https://github.com/mineek/MuffinStore) | [`build-muffinstore.yml`](.github/workflows/build-muffinstore.yml) | ![MuffinStore Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-muffinstore.yml/badge.svg) |
 | **Geranium** | iOS 定位模拟、守护进程管理、清理与监管工具 (TrollStore) | [c22dev/Geranium](https://github.com/c22dev/Geranium) | [`build-geranium.yml`](.github/workflows/build-geranium.yml) | ![Geranium Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-geranium.yml/badge.svg) |
-| **ChatGBeFree** | iOS 越狱插件 — 绕过 ChatGPT 强制升级限制 | [liamschwie/ChatGBeFree](https://github.com/liamschwie/ChatGBeFree) | [`build-chatgbefree.yml`](.github/workflows/build-chatgbefree.yml) | ![ChatGBeFree Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-chatgbefree.yml/badge.svg) |
-| **Asspp** | Swift 多区域 App Store 管理工具 (iOS + macOS) | [Lakr233/Asspp](https://github.com/Lakr233/Asspp) | [`build-asspp.yml`](.github/workflows/build-asspp.yml) | ![Asspp Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-asspp.yml/badge.svg) |
 
 ---
 
