@@ -1,0 +1,320 @@
+name: Geranium Auto Build
+
+on:
+  schedule:
+    - cron: '37 19 * * *' # 每天北京时间 03:37，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '强制编译指定的 Tag 版本 (例如: 1.1.4)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-geranium
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-22.04
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      app_id: ${{ steps.compare.outputs.app_id }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
+    steps:
+      - name: 获取上游最新 Tag 并检查本地 Release
+        id: compare
+        shell: bash
+        env:
+          APP_ID: geranium
+          FORCE_TAG: ${{ inputs.force_tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: c22dev/Geranium
+        run: |
+          set -euo pipefail
+          if [ -n "$FORCE_TAG" ]; then
+            UPSTREAM_TAG="$FORCE_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)
+            if [ -z "$UPSTREAM_TAG" ]; then
+              UPSTREAM_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+                | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+                | sort -V \
+                | tail -n 1)
+            fi
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "app_id=$APP_ID"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FORCE_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: c22dev/Geranium
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          APP_ID: ${{ needs.check-version.outputs.app_id }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="${APP_ID}-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-${{ needs.check-version.outputs.app_id }}
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build:
+    name: Build unsigned iOS arm64 TIPA
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Checkout immutable upstream commit (with submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: c22dev/Geranium
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+          submodules: true
+
+      - name: Setup Theos (for RootHelper)
+        uses: Randomblock1/theos-action@4e23d15886bca77b5f7c462a82567e0de33ebe0b # v1
+
+      - name: Build Geranium and package TIPA
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+
+          # 1. Build the main app with Xcode (unsigned, for TrollStore)
+          xcodebuild \
+            -project Geranium.xcodeproj \
+            -scheme Geranium \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            -destination 'generic/platform=iOS' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/Geranium.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::未找到构建产物 $APP_PATH"
+            find build/DerivedData/Build/Products -type d -name '*.app' -print || true
+            exit 1
+          fi
+
+          # 2. Copy .app to working directory and strip signature
+          TARGET_APP="build/Geranium.app"
+          rm -rf "$TARGET_APP"
+          cp -r "$APP_PATH" "$TARGET_APP"
+          codesign --remove "$TARGET_APP" 2>/dev/null || true
+          rm -rf "$TARGET_APP/_CodeSignature" "$TARGET_APP/embedded.mobileprovision"
+
+          # 3. Build RootHelper with Theos
+          cd RootHelper
+          make clean
+          make
+          cp .theos/obj/debug/GeraniumRootHelper ../"$TARGET_APP/GeraniumRootHelper"
+          cd ..
+
+          # 4. Add entitlements with ldid
+          ldid -Sentitlements.plist "$TARGET_APP/Geranium"
+          APPEX_BIN="$TARGET_APP/PlugIns/Bookmark Location in Geranium.appex/Bookmark Location in Geranium"
+          if [ -f "$APPEX_BIN" ]; then
+            ldid -S"Bookmark Location in Geranium/entitlements.plist" "$APPEX_BIN"
+          fi
+
+          # 5. Package .tipa
+          rm -rf build/Payload
+          mkdir build/Payload
+          cp -r "$TARGET_APP" build/Payload/Geranium.app
+          (
+            cd build
+            zip -qry "Geranium-${VERSION}-ios-arm64.tipa" Payload
+          )
+          rm -rf build/Payload
+
+          # 6. Verify the TIPA
+          TIPA="release-assets/Geranium-${VERSION}-ios-arm64.tipa"
+          mkdir -p release-assets
+          cp "build/Geranium-${VERSION}-ios-arm64.tipa" "$TIPA"
+
+          TMPDIR=$(mktemp -d)
+          trap 'rm -rf "$TMPDIR"' EXIT
+          unzip -q "$TIPA" -d "$TMPDIR"
+          APP_PATH=$(find "$TMPDIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::TIPA 中未找到 .app"
+            exit 1
+          fi
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")
+          BINARY="$APP_PATH/$EXECUTABLE"
+          test -f "$BINARY"
+          if [ "$(lipo -archs "$BINARY")" != "arm64" ]; then
+            echo "::error::iOS 可执行文件不是纯 arm64 真机架构"
+            exit 1
+          fi
+          if [ ! -f "$APP_PATH/GeraniumRootHelper" ]; then
+            echo "::error::缺少 GeraniumRootHelper 二进制"
+            exit 1
+          fi
+          if [ -d "$APP_PATH/_CodeSignature" ]; then
+            echo "::error::预期未签名应用，但检测到了 _CodeSignature"
+            exit 1
+          fi
+
+      - name: Upload verified build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-${{ needs.check-version.outputs.app_id }}
+          path: app-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, archive-source, build]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          APP_ID: ${{ needs.check-version.outputs.app_id }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "Geranium-${VERSION}-ios-arm64.tipa"
+            "${APP_ID}-${VERSION}-source.tar.gz"
+          )
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Geranium ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated build of [c22dev/Geranium ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/c22dev/Geranium/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
+
+            This is an unsigned iOS TrollStore app (.tipa). Install via [TrollStore](https://github.com/opa334/TrollStore) on iOS 15.0+.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
