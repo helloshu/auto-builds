@@ -254,6 +254,14 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev libudev-dev
 
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+          & "C:\Program Files\NASM\nasm.exe" -v
+
       - name: Sync version from tag
         shell: bash
         working-directory: ./app-src
@@ -307,8 +315,21 @@ jobs:
           APPIMAGE=$(realpath "${APPIMAGES[0]}")
           APPIMAGETOOL="$HOME/.cache/tauri/appimagetool-x86_64.AppImage"
           if [ ! -x "$APPIMAGETOOL" ]; then
-            echo "::error::Tauri 缓存中缺少 appimagetool，拒绝下载未校验的 continuous 构建"
-            exit 1
+            echo "Tauri 缓存中未找到 appimagetool，下载 1.9.1 稳定版并校验 SHA-256"
+            APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+            APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+            mkdir -p "$(dirname "$APPIMAGETOOL")"
+            curl -fsSL -o "$APPIMAGETOOL" "$APPIMAGETOOL_URL"
+            chmod +x "$APPIMAGETOOL"
+            ACTUAL_SHA256=$(sha256sum "$APPIMAGETOOL" | awk '{print $1}')
+            if [ "$ACTUAL_SHA256" != "$APPIMAGETOOL_SHA256" ]; then
+              echo "::error::appimagetool SHA-256 校验失败"
+              echo "  期望: $APPIMAGETOOL_SHA256"
+              echo "  实际: $ACTUAL_SHA256"
+              rm -f "$APPIMAGETOOL"
+              exit 1
+            fi
+            echo "SHA-256 校验通过"
           fi
           APPIMAGETOOL=$(realpath "$APPIMAGETOOL")
 
@@ -726,45 +747,22 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
-          PROJECT=$(find src-tauri/gen/apple -maxdepth 1 -type d -name '*.xcodeproj' -print -quit)
-          if [ -z "$PROJECT" ]; then
-            echo "::error::未找到生成的 Xcode 项目"
-            exit 1
-          fi
-          WORKSPACE="${PROJECT}/project.xcworkspace"
-          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json \
-            | jq -r '.workspace.schemes[] | select(endswith("_iOS"))' \
-            | head -n 1)
-          if [ -z "$SCHEME" ]; then
-            echo "::error::未找到 Tauri iOS scheme"
-            exit 1
-          fi
 
-          DERIVED_DATA="$PWD/src-tauri/gen/apple/build-unsigned"
-          xcodebuild \
-            -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
-            -configuration release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$DERIVED_DATA" \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY='' \
-            DEVELOPMENT_TEAM='' \
-            PROVISIONING_PROFILE_SPECIFIER='' \
-            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
-            build
+          # Use Tauri's official iOS build — it creates the options server that
+          # xcode-script reads during the Xcode build phase.  Bypassing tauri ios
+          # build and calling xcodebuild directly leaves the options file unset,
+          # causing a panic inside xcode-script.
+          # --no-sign: produce an unsigned .app, then Tauri packages an unsigned IPA.
+          npx tauri ios build --ci --target aarch64 --no-sign --build-number "$GITHUB_RUN_NUMBER"
 
-          PRODUCT_DIR="$DERIVED_DATA/Build/Products/release-iphoneos"
+          # Locate the unsigned .app inside the xcarchive that Tauri produced.
           APPS=()
           while IFS= read -r app; do
             APPS+=("$app")
-          done < <(find "$PRODUCT_DIR" -maxdepth 1 -type d -name '*.app' -print)
+          done < <(find src-tauri/gen/apple -type d -name '*.app' -path '*Products*Applications*' -print)
           if [ "${#APPS[@]}" -ne 1 ]; then
             echo "::error::预期 1 个真机 .app，实际 ${#APPS[@]} 个"
+            find src-tauri/gen/apple -type d -name '*.app' -print
             exit 1
           fi
           APP_PATH="${APPS[0]}"
