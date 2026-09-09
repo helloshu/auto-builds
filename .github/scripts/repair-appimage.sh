@@ -13,6 +13,7 @@ TMP_ROOT=''
 APPIMAGE_DIR=''
 APPIMAGE_BASE=''
 REPLACEMENT=''
+ROOT_DESKTOP=''
 
 die() {
     echo "::error::$*" >&2
@@ -210,8 +211,148 @@ remove_packaged_wayland() {
     [ "${#leftovers[@]}" -eq 0 ] || die "AppDir 仍残留包内 Wayland 平台库"
 }
 
+validate_root_desktop() {
+    local root=$1
+    local desktops=()
+    local desktop
+    while IFS= read -r -d '' desktop; do
+        desktops+=("$desktop")
+    done < <(find "$root" -maxdepth 1 \( -type f -o -type l \) -name '*.desktop' -print0)
+    [ "${#desktops[@]}" -eq 1 ] || die "验证失败：根目录 desktop 路径应为 1 个，实际为 ${#desktops[@]}"
+
+    desktop=${desktops[0]}
+    case "$desktop" in
+        "$root"/*) ;;
+        *) die "验证失败：根目录 desktop 路径不在 AppDir 内: $desktop" ;;
+    esac
+
+    if [ -L "$desktop" ]; then
+        local target
+        target=$(realpath -- "$desktop") || die "验证失败：根目录 desktop 是失效软链接: $desktop"
+        case "$target" in
+            "$root"/*) ;;
+            *) die "验证失败：根目录 desktop 解析到了 AppDir 外: $desktop -> $target" ;;
+        esac
+        [ -f "$target" ] || die "验证失败：根目录 desktop 目标不是普通文件: $target"
+        [ ! -L "$target" ] || die "验证失败：根目录 desktop 目标仍是软链接: $target"
+        [ -s "$target" ] || die "验证失败：根目录 desktop 目标是空文件: $target"
+    else
+        [ -f "$desktop" ] || die "验证失败：根目录 desktop 不是普通文件: $desktop"
+        [ -s "$desktop" ] || die "验证失败：根目录 desktop 是空文件: $desktop"
+    fi
+
+    printf '%s\n' "$desktop"
+}
+
+find_trusted_desktop_copy() {
+    local root=$1
+    local name=$2
+    local applications="$root/usr/share/applications"
+    local applications_resolved=''
+    local candidates=()
+    local candidate resolved
+
+    # Prefer an exact basename below the conventional applications directory.
+    # Do not follow an applications directory that escapes the AppDir, and do
+    # not accept symlink candidates.
+    if [ -e "$applications" ] || [ -L "$applications" ]; then
+        [ -d "$applications" ] || die "根目录 desktop 的可信副本目录不是目录: $applications"
+        applications_resolved=$(realpath -- "$applications") || die "无法解析 desktop 可信副本目录: $applications"
+        case "$applications_resolved" in
+            "$root"/*) ;;
+            *) die "拒绝访问 AppDir 之外的 desktop 可信副本目录: $applications -> $applications_resolved" ;;
+        esac
+        while IFS= read -r -d '' candidate; do
+            [ "$(basename -- "$candidate")" = "$name" ] || continue
+            resolved=$(realpath -- "$candidate") || die "无法解析 desktop 可信副本: $candidate"
+            case "$resolved" in
+                "$root"/*) ;;
+                *) die "desktop 可信副本解析到了 AppDir 外: $candidate -> $resolved" ;;
+            esac
+            [ -f "$candidate" ] || die "desktop 可信副本不是普通文件: $candidate"
+            [ ! -L "$candidate" ] || die "desktop 可信副本不得是软链接: $candidate"
+            [ -s "$candidate" ] || die "desktop 可信副本是空文件: $candidate"
+            candidates+=("$candidate")
+        done < <(find "$applications_resolved" -maxdepth 1 -type f -print0)
+    fi
+
+    if [ "${#candidates[@]}" -gt 1 ]; then
+        die "根目录 desktop 的可信副本不唯一: $name"
+    elif [ "${#candidates[@]}" -eq 1 ]; then
+        printf '%s\n' "${candidates[0]}"
+        return 0
+    fi
+
+    die "无法从 usr/share/applications 定位唯一可信的 desktop 副本: $name"
+}
+
+normalize_root_desktop() {
+    local root=$1
+    local desktops=()
+    local desktop
+    while IFS= read -r -d '' desktop; do
+        desktops+=("$desktop")
+    done < <(find "$root" -maxdepth 1 \( -type f -o -type l \) -name '*.desktop' -print0)
+    [ "${#desktops[@]}" -eq 1 ] || die "根目录 desktop 路径应为 1 个，实际为 ${#desktops[@]}"
+
+    desktop=${desktops[0]}
+    case "$desktop" in
+        "$root"/*) ;;
+        *) die "根目录 desktop 路径不在 AppDir 内: $desktop" ;;
+    esac
+
+    if [ -L "$desktop" ]; then
+        local target=''
+        local target_is_safe=0
+        if target=$(realpath -- "$desktop" 2>/dev/null); then
+            case "$target" in
+                "$root"/*)
+                    if [ -f "$target" ] && [ ! -L "$target" ] && [ -s "$target" ]; then
+                        target_is_safe=1
+                    fi
+                    ;;
+            esac
+        fi
+
+        if [ "$target_is_safe" -eq 1 ]; then
+            # Normalize internal links so the repacked AppImage never depends
+            # on an absolute or host-specific target.
+            local relative
+            relative=$(realpath --relative-to="$root" -- "$target") || die "无法计算根目录 desktop 相对路径"
+            [ -n "$relative" ] || die "根目录 desktop 相对路径为空"
+            rm -f -- "$desktop"
+            ln -s -- "$relative" "$desktop"
+        else
+            # Do not inspect an external or invalid link. Rebuild it only from
+            # an unambiguous, non-symlink, non-empty AppDir-internal copy.
+            local trusted
+            trusted=$(find_trusted_desktop_copy "$root" "$(basename -- "$desktop")")
+            local relative
+            relative=$(realpath --relative-to="$root" -- "$trusted") || die "无法计算可信 desktop 相对路径"
+            [ -n "$relative" ] || die "可信 desktop 相对路径为空"
+            rm -f -- "$desktop"
+            ln -s -- "$relative" "$desktop"
+        fi
+    else
+        [ -f "$desktop" ] || die "根目录 desktop 不是普通文件: $desktop"
+        [ -s "$desktop" ] || die "根目录 desktop 是空文件: $desktop"
+    fi
+
+    validate_root_desktop "$root"
+}
+
 repair_dir_icon() {
     local icon="$APPDIR/.DirIcon"
+    local desktop=${1:-}
+    [ -n "$desktop" ] || die "修复 .DirIcon 时缺少已验证的根目录 desktop"
+    case "$desktop" in
+        "$APPDIR"/*.desktop) ;;
+        *) die "根目录 desktop 不在 AppDir 内: $desktop" ;;
+    esac
+    # The caller passes the path returned by normalize_root_desktop. Keep a
+    # second, non-mutating check here so Icon metadata is never read through an
+    # external, stale, or empty desktop link.
+    desktop=$(validate_root_desktop "$APPDIR")
     case "$icon" in
         "$APPDIR"/*) ;;
         *) die "拒绝访问 AppDir 之外的路径: $icon" ;;
@@ -255,17 +396,11 @@ repair_dir_icon() {
         # desktop file and its safe icon name.
         rm -f -- "$icon"
 
-        local desktops=()
-        while IFS= read -r -d '' desktop; do
-            desktops+=("$desktop")
-        done < <(find "$APPDIR" -maxdepth 1 -type f -name '*.desktop' -print0)
-        [ "${#desktops[@]}" -eq 1 ] || die "缺少 .DirIcon，且无法定位唯一根目录 desktop 文件"
-
         local icon_values=()
         local icon_value
         while IFS= read -r icon_value; do
             icon_values+=("$icon_value")
-        done < <(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "${desktops[0]}")
+        done < <(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$desktop")
         [ "${#icon_values[@]}" -eq 1 ] || die "缺少 .DirIcon，desktop 文件必须有唯一的 Icon 字段"
 
         local icon_name="${icon_values[0]}"
@@ -293,19 +428,29 @@ repair_dir_icon() {
         # unique root-level match; only fall back to usr/share when the root
         # has no matching ordinary file.
         if [ "${#candidates[@]}" -eq 0 ]; then
-            while IFS= read -r -d '' candidate; do
-                base=$(basename -- "$candidate")
-                if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
-                    resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
-                    case "$resolved" in
-                        "$APPDIR"/*) ;;
-                        *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
-                    esac
-                    [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
-                    [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
-                    candidates+=("$resolved")
-                fi
-            done < <(find "$APPDIR/usr/share" -type f -print0 2>/dev/null || true)
+            local usr_share="$APPDIR/usr/share"
+            if [ -e "$usr_share" ] || [ -L "$usr_share" ]; then
+                [ -d "$usr_share" ] || die "候选图标目录不是目录: $usr_share"
+                local usr_share_resolved
+                usr_share_resolved=$(realpath -- "$usr_share") || die "无法解析候选图标目录: $usr_share"
+                case "$usr_share_resolved" in
+                    "$APPDIR"/*) ;;
+                    *) die "候选图标目录解析到了 AppDir 外: $usr_share -> $usr_share_resolved" ;;
+                esac
+                while IFS= read -r -d '' candidate; do
+                    base=$(basename -- "$candidate")
+                    if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
+                        resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
+                        case "$resolved" in
+                            "$APPDIR"/*) ;;
+                            *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
+                        esac
+                        [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
+                        [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
+                        candidates+=("$resolved")
+                    fi
+                done < <(find "$usr_share_resolved" -type f -print0)
+            fi
         fi
         [ "${#candidates[@]}" -eq 1 ] || die "缺少 .DirIcon，无法从 Icon=$icon_name 定位唯一图标"
 
@@ -371,9 +516,7 @@ verify_appdir() {
         \) -print0
     )
     [ -e "$APPDIR/AppRun" ] || die "验证失败：缺少 AppRun"
-    local desktop_count
-    desktop_count=$(find "$APPDIR" -maxdepth 1 -type f -name '*.desktop' | wc -l)
-    [ "$desktop_count" -eq 1 ] || die "验证失败：根目录 desktop 文件应为 1 个，实际为 $desktop_count"
+    validate_root_desktop "$APPDIR" >/dev/null
     validate_dir_icon
 }
 
@@ -384,7 +527,8 @@ GIO_MODULES=$(find_gio_modules "$APPDIR")
 
 rewrite_gtk_hook "$HOOK" "$GIO_MODULES"
 remove_packaged_wayland "$APPDIR"
-repair_dir_icon
+ROOT_DESKTOP=$(normalize_root_desktop "$APPDIR")
+repair_dir_icon "$ROOT_DESKTOP"
 verify_appdir "$APPDIR"
 
 APPIMAGE_DIR=$(dirname -- "$APPIMAGE")
