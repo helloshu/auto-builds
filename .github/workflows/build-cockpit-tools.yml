@@ -1,0 +1,381 @@
+name: Cockpit Tools Auto Build
+
+on:
+  schedule:
+    - cron: '27 19 * * *' # 每天北京时间 03:27，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新编译（跳过已发布检查）'
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: '指定上游 Tag（例如 v1.3.46；留空则使用 latest release）'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-cockpit-tools
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    name: Check upstream release
+    runs-on: ubuntu-22.04
+    outputs:
+      skip: ${{ steps.check_release.outputs.skip }}
+      upstream_tag: ${{ steps.get_tag.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.get_tag.outputs.upstream_sha }}
+      release_tag: ${{ steps.get_tag.outputs.release_tag }}
+    steps:
+      - name: Resolve latest release and immutable commit
+        id: get_tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          UPSTREAM_REPO: jlcodes99/cockpit-tools
+        run: |
+          set -euo pipefail
+
+          if [ -n "$REQUESTED_TAG" ]; then
+            UPSTREAM_TAG="$REQUESTED_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || true)
+            if [ -z "$UPSTREAM_TAG" ]; then
+              UPSTREAM_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+                | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1)
+            fi
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if ! [[ "$UPSTREAM_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::上游 Tag 必须是安全的 semver 标签，实际为: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+
+          ENCODED_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="cockpit-tools-${UPSTREAM_TAG}"
+          {
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "检测到上游版本 ${UPSTREAM_TAG}，固定提交 ${UPSTREAM_SHA}"
+
+      - name: Check whether this release already exists
+        id: check_release
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force || false }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.get_tag.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = true ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: jlcodes99/cockpit-tools
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="cockpit-tools-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-cockpit-tools
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build-linux:
+    name: Build Linux x86_64 artifacts
+    needs: check-version
+    if: needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: jlcodes99/cockpit-tools
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout this repository for shared AppImage repair
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: build-tools
+          persist-credentials: false
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app-src/package-lock.json
+
+      - name: Verify upstream build contract
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_files=(
+            package.json
+            src-tauri/tauri.ci.conf.json
+            sidecars/cockpit-cliproxy/go.mod
+          )
+          for path in "${required_files[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error::上游构建契约缺少文件: app-src/$path"
+              exit 1
+            fi
+          done
+          node -e 'const fs=require("node:fs"); const pkg=JSON.parse(fs.readFileSync("package.json","utf8")); const command=pkg?.scripts?.["release:preflight"]; if (typeof command !== "string" || command.trim() === "") { throw new Error("package.json 缺少非空 scripts.release:preflight"); }'
+          echo "上游构建契约检查通过"
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: app-src/src-tauri
+
+      - name: Setup Go from go.mod
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: app-src/sidecars/cockpit-cliproxy/go.mod
+          cache-dependency-path: app-src/sidecars/cockpit-cliproxy/go.sum
+
+      - name: Install upstream Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl file libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libudev-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libnm-dev patchelf pkg-config xdg-utils \
+            libfuse2
+
+      - name: Install frontend dependencies
+        working-directory: ./app-src
+        run: npm install
+
+      - name: Run upstream release preflight
+        working-directory: ./app-src
+        run: npm run release:preflight
+
+      - name: Test Go sidecar
+        working-directory: ./app-src/sidecars/cockpit-cliproxy
+        run: go test ./...
+
+      - name: Verify unsigned CI Tauri configuration
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e 'const fs=require("node:fs"); const p="src-tauri/tauri.ci.conf.json"; const c=JSON.parse(fs.readFileSync(p,"utf8")); if (c?.bundle?.createUpdaterArtifacts !== false) { throw new Error("tauri.ci.conf.json must disable updater artifacts"); }'
+
+      - name: Build Linux x86_64 bundles
+        working-directory: ./app-src
+        run: npx tauri build --ci --config src-tauri/tauri.ci.conf.json --bundles appimage,deb,rpm
+
+      - name: Repair and verify AppImage runtime
+        working-directory: ./app-src
+        shell: bash
+        env:
+          APPIMAGE_TOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          APPIMAGE_TOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          BUNDLE="src-tauri/target/release/bundle"
+          APPIMAGES=()
+          while IFS= read -r -d '' appimage; do
+            APPIMAGES+=("$appimage")
+          done < <(find "$BUNDLE/appimage" -maxdepth 1 -type f -name '*.AppImage' -print0)
+          if [ "${#APPIMAGES[@]}" -ne 1 ]; then
+            echo "::error::预期唯一 Linux x86_64 AppImage，实际 ${#APPIMAGES[@]} 个"
+            exit 1
+          fi
+
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+          curl -fsSL --retry 3 --retry-delay 2 -o "$APPIMAGETOOL" "$APPIMAGE_TOOL_URL"
+          chmod +x "$APPIMAGETOOL"
+          printf '%s  %s\n' "$APPIMAGE_TOOL_SHA256" "$APPIMAGETOOL" | sha256sum --check --status
+          REPAIR_SCRIPT="../build-tools/.github/scripts/repair-appimage.sh"
+          chmod +x "$REPAIR_SCRIPT"
+          "$REPAIR_SCRIPT" "$(realpath "${APPIMAGES[0]}")" "$APPIMAGETOOL"
+
+      - name: Collect and verify Linux artifacts
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          PREFIX="cockpit-tools-${VERSION}-linux-x86_64"
+          BUNDLE="src-tauri/target/release/bundle"
+          mkdir -p release-assets
+
+          copy_one() {
+            local directory=$1
+            local pattern=$2
+            local destination=$3
+            local matches=()
+            while IFS= read -r -d '' match; do
+              matches+=("$match")
+            done < <(find "$BUNDLE/$directory" -maxdepth 1 -type f -name "$pattern" -print0)
+            if [ "${#matches[@]}" -ne 1 ] || [ ! -s "${matches[0]:-}" ]; then
+              echo "::error::${directory}/${pattern} 应匹配唯一非空产物，实际 ${#matches[@]} 个"
+              exit 1
+            fi
+            cp -- "${matches[0]}" "release-assets/$destination"
+          }
+
+          copy_one appimage '*.AppImage' "${PREFIX}.AppImage"
+          copy_one deb '*.deb' "${PREFIX}.deb"
+          copy_one rpm '*.rpm' "${PREFIX}.rpm"
+
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 3
+
+      - name: Upload verified Linux artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-cockpit-tools
+          path: app-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Publish GitHub Release
+    needs: [check-version, archive-source, build-linux]
+    if: needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download source and Linux artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify exact release manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "cockpit-tools-${VERSION}-linux-x86_64.AppImage"
+            "cockpit-tools-${VERSION}-linux-x86_64.deb"
+            "cockpit-tools-${VERSION}-linux-x86_64.rpm"
+            "cockpit-tools-${VERSION}-source.tar.gz"
+          )
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \\./#  #' > SHA256SUMS
+          test -s SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/*
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Cockpit Tools ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated Linux x86_64 build of [jlcodes99/cockpit-tools ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/jlcodes99/cockpit-tools/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            The AppImage includes a targeted runtime repair for Debian 13 + KDE Wayland + Mesa 25. Other Linux distributions and graphics stacks are not guaranteed.
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the release artifacts.
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

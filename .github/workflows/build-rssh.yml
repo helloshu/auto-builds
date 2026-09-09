@@ -69,7 +69,7 @@ jobs:
         id: check_release
         shell: bash
         env:
-          FORCE: ${{ inputs.force }}
+          FORCE: ${{ inputs.force || false }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.get_tag.outputs.release_tag }}
         run: |
@@ -228,6 +228,14 @@ jobs:
           path: app-src
           persist-credentials: false
 
+      - name: Checkout this repository for shared Linux packaging scripts
+        if: runner.os == 'Linux'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: build-tools
+          persist-credentials: false
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -294,7 +302,7 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
 
-      - name: Fix and verify AppImage icon symlink
+      - name: Repair and verify Linux AppImage runtime
         if: runner.os == 'Linux'
         shell: bash
         working-directory: ./app-src
@@ -314,42 +322,27 @@ jobs:
 
           APPIMAGE=$(realpath "${APPIMAGES[0]}")
           APPIMAGETOOL="$HOME/.cache/tauri/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
           if [ ! -x "$APPIMAGETOOL" ]; then
             echo "Tauri 缓存中未找到 appimagetool，下载 1.9.1 稳定版并校验 SHA-256"
             APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
-            APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
             mkdir -p "$(dirname "$APPIMAGETOOL")"
-            curl -fsSL -o "$APPIMAGETOOL" "$APPIMAGETOOL_URL"
+            curl -fsSL --retry 3 --retry-delay 2 -o "$APPIMAGETOOL" "$APPIMAGETOOL_URL"
             chmod +x "$APPIMAGETOOL"
-            ACTUAL_SHA256=$(sha256sum "$APPIMAGETOOL" | awk '{print $1}')
-            if [ "$ACTUAL_SHA256" != "$APPIMAGETOOL_SHA256" ]; then
-              echo "::error::appimagetool SHA-256 校验失败"
-              echo "  期望: $APPIMAGETOOL_SHA256"
-              echo "  实际: $ACTUAL_SHA256"
-              rm -f "$APPIMAGETOOL"
-              exit 1
-            fi
-            echo "SHA-256 校验通过"
           fi
-          APPIMAGETOOL=$(realpath "$APPIMAGETOOL")
-
-          cd "$(dirname "$APPIMAGE")"
-          BASE=$(basename "$APPIMAGE")
-          rm -rf squashfs-root
-          "./$BASE" --appimage-extract >/dev/null
-          if [ -L squashfs-root/.DirIcon ]; then
-            ln -sf "$(basename "$(readlink squashfs-root/.DirIcon)")" squashfs-root/.DirIcon
-          fi
-          ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run squashfs-root "$BASE"
-          rm -rf squashfs-root
-
-          "./$BASE" --appimage-extract >/dev/null
-          ICON_TARGET=$(readlink squashfs-root/.DirIcon || true)
-          if [ -z "$ICON_TARGET" ] || [[ "$ICON_TARGET" = /* ]]; then
-            echo "::error::AppImage .DirIcon 仍不是有效的相对软链接"
+          ACTUAL_SHA256=$(sha256sum "$APPIMAGETOOL" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$APPIMAGETOOL_SHA256" ]; then
+            echo "::error::appimagetool SHA-256 校验失败"
+            echo "  期望: $APPIMAGETOOL_SHA256"
+            echo "  实际: $ACTUAL_SHA256"
             exit 1
           fi
-          rm -rf squashfs-root
+          echo "appimagetool SHA-256 校验通过"
+          APPIMAGETOOL=$(realpath "$APPIMAGETOOL")
+          REPAIR_SCRIPT="../build-tools/.github/scripts/repair-appimage.sh"
+          chmod +x "$REPAIR_SCRIPT"
+          "$REPAIR_SCRIPT" "$APPIMAGE" "$APPIMAGETOOL"
 
       - name: Collect and verify desktop artifacts
         shell: bash
