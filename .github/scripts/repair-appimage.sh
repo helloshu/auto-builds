@@ -358,29 +358,120 @@ repair_dir_icon() {
         *) die "拒绝访问 AppDir 之外的路径: $icon" ;;
     esac
 
+    # Capture a symlink's raw target before any realpath/stat/delete operation
+    # involving .DirIcon. The NUL-delimited read preserves embedded newlines
+    # and other non-NUL bytes for the later control-character check.
+    local link_text=''
+    local is_symlink=0
+    if IFS= read -r -d '' link_text < <(readlink -z -- "$icon" 2>/dev/null); then
+        is_symlink=1
+    elif [ -L "$icon" ]; then
+        die "无法读取 .DirIcon 软链接文本"
+    fi
+
+    local recovery_hint=''
     local rebuild=0
-    if [ -L "$icon" ]; then
-        local target
-        if target=$(realpath -- "$icon" 2>/dev/null); then
-            case "$target" in
-                "$APPDIR"/*)
-                    if [ -f "$target" ]; then
-                        local relative
-                        relative=$(realpath --relative-to="$APPDIR" -- "$target")
-                        [ -n "$relative" ] || die "无法计算 .DirIcon 相对路径"
-                        rm -f -- "$icon"
-                        ln -s -- "$relative" "$icon"
-                    else
-                        rebuild=1
-                    fi
-                    ;;
-                *)
-                    # Do not inspect a target outside the AppDir. The link is
-                    # stale or unsafe and will be reconstructed from desktop
-                    # metadata below.
-                    rebuild=1
-                    ;;
+    if [ "$is_symlink" -eq 1 ]; then
+        local raw_hint_valid=1
+        local raw_basename="${link_text##*/}"
+
+        # Validate the raw link text before resolving or deleting anything.
+        # An invalid hint is ignored and the desktop metadata fallback below
+        # remains responsible for recovery.
+        [ -n "$link_text" ] || raw_hint_valid=0
+        case "$link_text" in
+            */) raw_hint_valid=0 ;;
+        esac
+        [[ "$link_text" =~ [[:cntrl:]] ]] && raw_hint_valid=0
+        [[ "$raw_basename" =~ ^[A-Za-z0-9][-A-Za-z0-9._+]*\.[A-Za-z0-9]+$ ]] || raw_hint_valid=0
+        case "$raw_basename" in
+            -*) raw_hint_valid=0 ;;
+        esac
+
+        local raw_rest="$link_text"
+        local raw_component=''
+        while :; do
+            if [[ "$raw_rest" == */* ]]; then
+                raw_component=${raw_rest%%/*}
+                raw_rest=${raw_rest#*/}
+            else
+                raw_component=$raw_rest
+                break
+            fi
+            case "$raw_component" in
+                .|..) raw_hint_valid=0 ;;
             esac
+        done
+        case "$raw_rest" in
+            .|..) raw_hint_valid=0 ;;
+        esac
+        if [ "$raw_hint_valid" -eq 1 ]; then
+            recovery_hint="$raw_basename"
+        fi
+
+        local target=''
+        local target_candidate=''
+        local target_lexically_safe=$raw_hint_valid
+
+        if [[ "$link_text" = /* ]]; then
+            case "$link_text" in
+                "$APPDIR"/*) target_candidate="$link_text" ;;
+                *) target_lexically_safe=0 ;;
+            esac
+        else
+            target_candidate="$APPDIR/$link_text"
+        fi
+
+        # Do not resolve through a symlinked target component. Such a path may
+        # escape the AppDir; it is handled by the raw-hint recovery branch.
+        if [ "$target_lexically_safe" -eq 1 ]; then
+            local target_suffix
+            if [[ "$link_text" = /* ]]; then
+                target_suffix=${link_text#"$APPDIR"}
+            else
+                target_suffix="$link_text"
+            fi
+            local target_prefix="$APPDIR"
+            local target_rest="$target_suffix"
+            local target_component=''
+            while :; do
+                if [[ "$target_rest" == */* ]]; then
+                    target_component=${target_rest%%/*}
+                    target_rest=${target_rest#*/}
+                else
+                    target_component=$target_rest
+                    target_rest=''
+                fi
+                if [ -n "$target_component" ]; then
+                    target_prefix="$target_prefix/$target_component"
+                    if [ -L "$target_prefix" ]; then
+                        target_lexically_safe=0
+                        break
+                    fi
+                fi
+                [ -n "$target_rest" ] || break
+            done
+        fi
+
+        if [ "$target_lexically_safe" -eq 1 ]; then
+            if target=$(realpath -- "$target_candidate" 2>/dev/null); then
+                case "$target" in
+                    "$APPDIR"/*)
+                        if [ -f "$target" ]; then
+                            local relative
+                            relative=$(realpath --relative-to="$APPDIR" -- "$target")
+                            [ -n "$relative" ] || die "无法计算 .DirIcon 相对路径"
+                            rm -f -- "$icon"
+                            ln -s -- "$relative" "$icon"
+                        else
+                            rebuild=1
+                        fi
+                        ;;
+                    *) rebuild=1 ;;
+                esac
+            else
+                rebuild=1
+            fi
         else
             rebuild=1
         fi
@@ -392,37 +483,59 @@ repair_dir_icon() {
 
     if [ "$rebuild" -eq 1 ]; then
         # Tauri normally supplies .DirIcon. If a newer bundler omits it, or
-        # supplies a stale/unsafe link, reconstruct it from the single root
-        # desktop file and its safe icon name.
+        # supplies a stale/unsafe link, reconstruct it from a safe recovery
+        # hint or the single root desktop file and its safe icon name.
         rm -f -- "$icon"
-
-        local icon_values=()
-        local icon_value
-        while IFS= read -r icon_value; do
-            icon_values+=("$icon_value")
-        done < <(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$desktop")
-        [ "${#icon_values[@]}" -eq 1 ] || die "缺少 .DirIcon，desktop 文件必须有唯一的 Icon 字段"
-
-        local icon_name="${icon_values[0]}"
-        [[ "$icon_name" =~ ^[A-Za-z0-9][-A-Za-z0-9._+]*$ ]] || die "拒绝不安全的 Icon 名称: $icon_name"
-        [ "$icon_name" != "." ] || die "拒绝不安全的 Icon 名称: $icon_name"
-        [ "$icon_name" != ".." ] || die "拒绝不安全的 Icon 名称: $icon_name"
 
         local candidates=()
         local candidate base resolved
-        while IFS= read -r -d '' candidate; do
-            base=$(basename -- "$candidate")
-            if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
-                resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
-                case "$resolved" in
-                    "$APPDIR"/*) ;;
-                    *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
-                esac
-                [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
-                [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
-                candidates+=("$resolved")
-            fi
-        done < <(find "$APPDIR" -maxdepth 1 -type f ! -name '*.desktop' -print0)
+        local icon_name=''
+        if [ -n "$recovery_hint" ]; then
+            while IFS= read -r -d '' candidate; do
+                base=$(basename -- "$candidate")
+                if [ "$base" = "$recovery_hint" ]; then
+                    resolved=$(realpath -- "$candidate") || die "无法解析 .DirIcon 恢复候选: $candidate"
+                    case "$resolved" in
+                        "$APPDIR"/*) ;;
+                        *) die ".DirIcon 恢复候选解析到了 AppDir 外: $candidate -> $resolved" ;;
+                    esac
+                    [ -f "$candidate" ] || die ".DirIcon 恢复候选不是普通文件: $candidate"
+                    [ ! -L "$candidate" ] || die ".DirIcon 恢复候选不得是软链接: $candidate"
+                    [ -s "$candidate" ] || die ".DirIcon 恢复候选是空文件: $candidate"
+                    candidates+=("$resolved")
+                fi
+            done < <(find "$APPDIR" -maxdepth 1 -type f ! -name '*.desktop' -print0)
+            [ "${#candidates[@]}" -le 1 ] || die ".DirIcon 恢复候选不唯一: $recovery_hint"
+        fi
+
+        if [ "${#candidates[@]}" -eq 0 ]; then
+            local icon_values=()
+            local icon_value
+            while IFS= read -r icon_value; do
+                icon_values+=("$icon_value")
+            done < <(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$desktop")
+            [ "${#icon_values[@]}" -eq 1 ] || die "缺少 .DirIcon，desktop 文件必须有唯一的 Icon 字段"
+
+            icon_name="${icon_values[0]}"
+            [[ "$icon_name" =~ ^[A-Za-z0-9][-A-Za-z0-9._+]*$ ]] || die "拒绝不安全的 Icon 名称: $icon_name"
+            [ "$icon_name" != "." ] || die "拒绝不安全的 Icon 名称: $icon_name"
+            [ "$icon_name" != ".." ] || die "拒绝不安全的 Icon 名称: $icon_name"
+
+            while IFS= read -r -d '' candidate; do
+                base=$(basename -- "$candidate")
+                if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
+                    resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
+                    case "$resolved" in
+                        "$APPDIR"/*) ;;
+                        *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
+                    esac
+                    [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
+                    [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
+                    [ -s "$candidate" ] || die "候选图标是空文件: $candidate"
+                    candidates+=("$resolved")
+                fi
+            done < <(find "$APPDIR" -maxdepth 1 -type f ! -name '*.desktop' -print0)
+        fi
 
         # Tauri may place the icon beside the root desktop file. Prefer a
         # unique root-level match; only fall back to usr/share when the root
@@ -447,6 +560,7 @@ repair_dir_icon() {
                         esac
                         [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
                         [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
+                        [ -s "$candidate" ] || die "候选图标是空文件: $candidate"
                         candidates+=("$resolved")
                     fi
                 done < <(find "$usr_share_resolved" -type f -print0)
