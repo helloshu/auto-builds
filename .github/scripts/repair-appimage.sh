@@ -212,48 +212,106 @@ remove_packaged_wayland() {
 
 repair_dir_icon() {
     local icon="$APPDIR/.DirIcon"
-    assert_inside_appdir "$icon"
+    case "$icon" in
+        "$APPDIR"/*) ;;
+        *) die "拒绝访问 AppDir 之外的路径: $icon" ;;
+    esac
 
+    local rebuild=0
     if [ -L "$icon" ]; then
         local target
-        target=$(realpath -- "$icon") || die ".DirIcon 是失效软链接"
-        assert_inside_tmp "$target"
-        assert_inside_appdir "$target"
-        [ -f "$target" ] || die ".DirIcon 目标不是普通文件: $target"
-        local relative
-        relative=$(realpath --relative-to="$APPDIR" -- "$target")
-        [ -n "$relative" ] || die "无法计算 .DirIcon 相对路径"
-        rm -f -- "$icon"
-        ln -s -- "$relative" "$icon"
+        if target=$(realpath -- "$icon" 2>/dev/null); then
+            case "$target" in
+                "$APPDIR"/*)
+                    if [ -f "$target" ]; then
+                        local relative
+                        relative=$(realpath --relative-to="$APPDIR" -- "$target")
+                        [ -n "$relative" ] || die "无法计算 .DirIcon 相对路径"
+                        rm -f -- "$icon"
+                        ln -s -- "$relative" "$icon"
+                    else
+                        rebuild=1
+                    fi
+                    ;;
+                *)
+                    # Do not inspect a target outside the AppDir. The link is
+                    # stale or unsafe and will be reconstructed from desktop
+                    # metadata below.
+                    rebuild=1
+                    ;;
+            esac
+        else
+            rebuild=1
+        fi
     elif [ -f "$icon" ]; then
         [ -s "$icon" ] || die ".DirIcon 是空文件"
     else
-        # Tauri normally supplies .DirIcon. If a newer bundler omits it,
-        # reconstruct it from the single root desktop file and its icon name.
+        rebuild=1
+    fi
+
+    if [ "$rebuild" -eq 1 ]; then
+        # Tauri normally supplies .DirIcon. If a newer bundler omits it, or
+        # supplies a stale/unsafe link, reconstruct it from the single root
+        # desktop file and its safe icon name.
+        rm -f -- "$icon"
+
         local desktops=()
         while IFS= read -r -d '' desktop; do
             desktops+=("$desktop")
         done < <(find "$APPDIR" -maxdepth 1 -type f -name '*.desktop' -print0)
         [ "${#desktops[@]}" -eq 1 ] || die "缺少 .DirIcon，且无法定位唯一根目录 desktop 文件"
 
-        local icon_name
-        icon_name=$(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p' "${desktops[0]}" | head -n 1)
-        [ -n "$icon_name" ] || die "缺少 .DirIcon，desktop 文件没有 Icon 字段"
+        local icon_values=()
+        local icon_value
+        while IFS= read -r icon_value; do
+            icon_values+=("$icon_value")
+        done < <(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "${desktops[0]}")
+        [ "${#icon_values[@]}" -eq 1 ] || die "缺少 .DirIcon，desktop 文件必须有唯一的 Icon 字段"
+
+        local icon_name="${icon_values[0]}"
+        [[ "$icon_name" =~ ^[A-Za-z0-9][-A-Za-z0-9._+]*$ ]] || die "拒绝不安全的 Icon 名称: $icon_name"
+        [ "$icon_name" != "." ] || die "拒绝不安全的 Icon 名称: $icon_name"
+        [ "$icon_name" != ".." ] || die "拒绝不安全的 Icon 名称: $icon_name"
 
         local candidates=()
-        local candidate base
+        local candidate base resolved
         while IFS= read -r -d '' candidate; do
             base=$(basename -- "$candidate")
             if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
-                candidates+=("$candidate")
+                resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
+                case "$resolved" in
+                    "$APPDIR"/*) ;;
+                    *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
+                esac
+                [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
+                [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
+                candidates+=("$resolved")
             fi
-        done < <(find "$APPDIR/usr/share" -type f -print0 2>/dev/null || true)
+        done < <(find "$APPDIR" -maxdepth 1 -type f ! -name '*.desktop' -print0)
+
+        # Tauri may place the icon beside the root desktop file. Prefer a
+        # unique root-level match; only fall back to usr/share when the root
+        # has no matching ordinary file.
+        if [ "${#candidates[@]}" -eq 0 ]; then
+            while IFS= read -r -d '' candidate; do
+                base=$(basename -- "$candidate")
+                if [ "$base" = "$icon_name" ] || [[ "$base" == "$icon_name".* ]]; then
+                    resolved=$(realpath -- "$candidate") || die "无法解析候选图标: $candidate"
+                    case "$resolved" in
+                        "$APPDIR"/*) ;;
+                        *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
+                    esac
+                    [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
+                    [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
+                    candidates+=("$resolved")
+                fi
+            done < <(find "$APPDIR/usr/share" -type f -print0 2>/dev/null || true)
+        fi
         [ "${#candidates[@]}" -eq 1 ] || die "缺少 .DirIcon，无法从 Icon=$icon_name 定位唯一图标"
 
-        assert_inside_tmp "${candidates[0]}"
-        assert_inside_appdir "${candidates[0]}"
         local relative
         relative=$(realpath --relative-to="$APPDIR" -- "${candidates[0]}")
+        [ -n "$relative" ] || die "无法计算 .DirIcon 相对路径"
         ln -s -- "$relative" "$icon"
     fi
 
