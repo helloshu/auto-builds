@@ -566,6 +566,33 @@ repair_dir_icon() {
                 done < <(find "$usr_share_resolved" -type f -print0)
             fi
         fi
+
+        # Some Tauri bundles use a human-readable root icon filename instead
+        # of the desktop Icon= basename (for example, "Cockpit Tools.png"
+        # for Icon=cockpit-tools). Only use this fallback after the recovery
+        # hint and exact Icon= lookup found no candidate. Keep it deliberately
+        # shallow and fail closed unless there is exactly one safe image file.
+        if [ "${#candidates[@]}" -eq 0 ]; then
+            local root_image_candidates=()
+            while IFS= read -r -d '' candidate; do
+                base=$(basename -- "$candidate")
+                case "$base" in
+                    *.png|*.svg|*.xpm)
+                        resolved=$(realpath -- "$candidate") || die "无法解析根目录图像候选: $candidate"
+                        case "$resolved" in
+                            "$APPDIR"/*) ;;
+                            *) die "根目录图像候选解析到了 AppDir 外: $candidate -> $resolved" ;;
+                        esac
+                        [ -f "$candidate" ] || die "根目录图像候选不是普通文件: $candidate"
+                        [ ! -L "$candidate" ] || die "根目录图像候选不得是软链接: $candidate"
+                        [ -s "$candidate" ] || die "根目录图像候选是空文件: $candidate"
+                        root_image_candidates+=("$resolved")
+                        ;;
+                esac
+            done < <(find "$APPDIR" -maxdepth 1 \( -type f -o -type l \) -print0)
+            [ "${#root_image_candidates[@]}" -eq 1 ] || die "缺少 .DirIcon，无法从 AppDir 根目录定位唯一图像"
+            candidates+=("${root_image_candidates[0]}")
+        fi
         [ "${#candidates[@]}" -eq 1 ] || die "缺少 .DirIcon，无法从 Icon=$icon_name 定位唯一图标"
 
         local relative
