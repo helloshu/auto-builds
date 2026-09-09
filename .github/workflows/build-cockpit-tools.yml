@@ -216,7 +216,10 @@ jobs:
 
       - name: Run upstream release preflight
         working-directory: ./app-src
-        run: npm run release:preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u NVM_DIR npm run release:preflight
 
       - name: Test Go sidecar
         working-directory: ./app-src/sidecars/cockpit-cliproxy
