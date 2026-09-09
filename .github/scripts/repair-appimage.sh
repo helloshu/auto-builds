@@ -542,7 +542,8 @@ repair_dir_icon() {
         # for Icon=cockpit-tools). Only use this fallback after the recovery
         # hint and exact root-level Icon= lookup found no candidate. Keep it
         # deliberately shallow and fail closed unless there is exactly one
-        # safe image file.
+        # safe image file. Root-level symlinks are valid metadata when their
+        # canonical target remains inside the AppDir and is a non-empty file.
         if [ "${#candidates[@]}" -eq 0 ]; then
             local root_image_candidates=()
             while IFS= read -r -d '' candidate; do
@@ -554,9 +555,9 @@ repair_dir_icon() {
                             "$APPDIR"/*) ;;
                             *) die "根目录图像候选解析到了 AppDir 外: $candidate -> $resolved" ;;
                         esac
-                        [ -f "$candidate" ] || die "根目录图像候选不是普通文件: $candidate"
-                        [ ! -L "$candidate" ] || die "根目录图像候选不得是软链接: $candidate"
-                        [ -s "$candidate" ] || die "根目录图像候选是空文件: $candidate"
+                        [ -f "$resolved" ] || die "根目录图像候选目标不是普通文件: $candidate -> $resolved"
+                        [ ! -L "$resolved" ] || die "根目录图像候选目标不得是软链接: $candidate -> $resolved"
+                        [ -s "$resolved" ] || die "根目录图像候选目标是空文件: $candidate -> $resolved"
                         root_image_candidates+=("$resolved")
                         ;;
                 esac
