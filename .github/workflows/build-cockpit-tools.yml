@@ -245,7 +245,7 @@ jobs:
           UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          BUNDLE="src-tauri/target/release/bundle"
+          BUNDLE="target/release/bundle"
           APPIMAGES=()
           while IFS= read -r -d '' appimage; do
             APPIMAGES+=("$appimage")
@@ -272,7 +272,7 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           PREFIX="cockpit-tools-${VERSION}-linux-x86_64"
-          BUNDLE="src-tauri/target/release/bundle"
+          BUNDLE="target/release/bundle"
           mkdir -p release-assets
 
           copy_one() {
