@@ -529,12 +529,12 @@ repair_dir_icon() {
                         "$APPDIR"/*) ;;
                         *) die "候选图标解析到了 AppDir 外: $candidate -> $resolved" ;;
                     esac
-                    [ -f "$candidate" ] || die "候选图标不是普通文件: $candidate"
-                    [ ! -L "$candidate" ] || die "候选图标不得是软链接: $candidate"
-                    [ -s "$candidate" ] || die "候选图标是空文件: $candidate"
+                    [ -f "$resolved" ] || die "候选图标目标不是普通文件: $candidate -> $resolved"
+                    [ ! -L "$resolved" ] || die "候选图标目标不得是软链接: $candidate -> $resolved"
+                    [ -s "$resolved" ] || die "候选图标目标是空文件: $candidate -> $resolved"
                     candidates+=("$resolved")
                 fi
-            done < <(find "$APPDIR" -maxdepth 1 -type f ! -name '*.desktop' -print0)
+            done < <(find "$APPDIR" -maxdepth 1 \( -type f -o -type l \) ! -name '*.desktop' -print0)
         fi
 
         # Some Tauri bundles use a human-readable root icon filename instead
