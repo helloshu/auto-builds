@@ -223,7 +223,8 @@ jobs:
 
       - name: Test Go sidecar
         working-directory: ./app-src/sidecars/cockpit-cliproxy
-        run: go test ./...
+        shell: bash
+        run: bash ../../../build-tools/.github/scripts/test-go-sidecar.sh
 
       - name: Verify unsigned CI Tauri configuration
         working-directory: ./app-src
