@@ -9,7 +9,6 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 | Application | Description / Architecture | Upstream Repository | Workflow | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **RSSH** | Rust / Tauri Cross-platform Terminal & SSH Client | [shihuili1218/rssh](https://github.com/shihuili1218/rssh) | [`build-rssh.yml`](.github/workflows/build-rssh.yml) | ![RSSH Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-rssh.yml/badge.svg) |
-| **Cockpit Tools** | Tauri desktop AI coding and terminal toolkit (Linux x86_64) | [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | [`build-cockpit-tools.yml`](.github/workflows/build-cockpit-tools.yml) | ![Cockpit Tools Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-cockpit-tools.yml/badge.svg) |
 | **FlowZ** | Electron Workflow Desktop Client | [dododook/FlowZ](https://github.com/dododook/FlowZ) | [`build-flowz.yml`](.github/workflows/build-flowz.yml) | ![FlowZ Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-flowz.yml/badge.svg) |
 | **MuffinStore** | iOS App Store downgrader / installer (TrollStore) | [mineek/MuffinStore](https://github.com/mineek/MuffinStore) | [`build-muffinstore.yml`](.github/workflows/build-muffinstore.yml) | ![MuffinStore Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-muffinstore.yml/badge.svg) |
 | **Geranium** | iOS LocSim, Daemon Manager, Cleaner & Superviser (TrollStore) | [c22dev/Geranium](https://github.com/c22dev/Geranium) | [`build-geranium.yml`](.github/workflows/build-geranium.yml) | ![Geranium Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-geranium.yml/badge.svg) |
@@ -29,7 +28,7 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 
 ### Linux AppImage compatibility
 
-The RSSH and Cockpit Tools Linux x86_64 AppImages receive a targeted post-build runtime repair for Debian 13 on KDE Wayland with Mesa 25. The repair keeps the host graphics stack, isolates incompatible GIO modules, and preserves Wayland-first/X11-fallback behavior. Other distributions, desktop environments, and graphics stacks are not guaranteed; use the native `.deb` or another build when this target does not match your system.
+The RSSH Linux x86_64 AppImage receives a targeted post-build runtime repair for Debian 13 on KDE Wayland with Mesa 25. The repair keeps the host graphics stack, isolates incompatible GIO modules, and preserves Wayland-first/X11-fallback behavior. Other distributions, desktop environments, and graphics stacks are not guaranteed; use the native `.deb` or another build when this target does not match your system.
 
 ---
 

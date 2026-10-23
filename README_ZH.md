@@ -9,7 +9,6 @@
 | 应用名称 | 说明 / 架构 | 上游源码仓库 | 编译工作流 | 构建状态 |
 | :--- | :--- | :--- | :--- | :--- |
 | **RSSH** | Rust / Tauri 跨平台 Terminal / SSH 客户端 | [shihuili1218/rssh](https://github.com/shihuili1218/rssh) | [`build-rssh.yml`](.github/workflows/build-rssh.yml) | ![RSSH Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-rssh.yml/badge.svg) |
-| **Cockpit Tools** | Tauri 桌面端 AI 编程与终端工具集（Linux x86_64） | [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | [`build-cockpit-tools.yml`](.github/workflows/build-cockpit-tools.yml) | ![Cockpit Tools Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-cockpit-tools.yml/badge.svg) |
 | **FlowZ** | Electron 工作流桌面端 | [dododook/FlowZ](https://github.com/dododook/FlowZ) | [`build-flowz.yml`](.github/workflows/build-flowz.yml) | ![FlowZ Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-flowz.yml/badge.svg) |
 | **MuffinStore** | iOS App Store 降级 / 安装工具 (TrollStore) | [mineek/MuffinStore](https://github.com/mineek/MuffinStore) | [`build-muffinstore.yml`](.github/workflows/build-muffinstore.yml) | ![MuffinStore Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-muffinstore.yml/badge.svg) |
 | **Geranium** | iOS 定位模拟、守护进程管理、清理与监管工具 (TrollStore) | [c22dev/Geranium](https://github.com/c22dev/Geranium) | [`build-geranium.yml`](.github/workflows/build-geranium.yml) | ![Geranium Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-geranium.yml/badge.svg) |
@@ -29,7 +28,7 @@
 
 ### Linux AppImage 兼容性
 
-RSSH 与 Cockpit Tools 的 Linux x86_64 AppImage 会在构建后针对 Debian 13 + KDE Wayland + Mesa 25 进行定向运行时修整：使用宿主图形栈、隔离不兼容的 GIO 模块，并保持 Wayland 优先、X11 回退。其他发行版、桌面环境和图形栈不作保证；如果系统环境不匹配，请改用原生 `.deb` 或其他构建产物。
+RSSH 的 Linux x86_64 AppImage 会在构建后针对 Debian 13 + KDE Wayland + Mesa 25 进行定向运行时修整：使用宿主图形栈、隔离不兼容的 GIO 模块，并保持 Wayland 优先、X11 回退。其他发行版、桌面环境和图形栈不作保证；如果系统环境不匹配，请改用原生 `.deb` 或其他构建产物。
 
 ---
 
