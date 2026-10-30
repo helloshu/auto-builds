@@ -177,7 +177,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: app-src/src-tauri
+          workspaces: app-src
 
       - name: Install Linux dependencies
         run: |
@@ -190,9 +190,13 @@ jobs:
         working-directory: ./app-src
         run: npm test
 
+      - name: Build frontend for embedded server
+        working-directory: ./app-src
+        run: npm run build
+
       - name: Backend tests
-        working-directory: ./app-src/src-tauri
-        run: cargo test
+        working-directory: ./app-src
+        run: cargo test --workspace --all-features
 
   build-desktop:
     needs: [check-update, test]
@@ -205,7 +209,7 @@ jobs:
             target: aarch64-apple-darwin
             os_name: macos
             arch: aarch64
-          - os: macos-15
+          - os: macos-14
             target: x86_64-apple-darwin
             os_name: macos
             arch: x86_64
@@ -252,7 +256,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: app-src/src-tauri
+          workspaces: app-src
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -279,26 +283,15 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
-          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
-          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
-
-      - name: Stage CLI for bundling
-        shell: bash
-        working-directory: ./app-src
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          cargo build --manifest-path src-tauri/Cargo.toml --release --features cli --bin rssh-cli --target "$TARGET"
-          mkdir -p src-tauri/bin
-          NAME=rssh-cli
-          if [[ "$TARGET" == *windows* ]]; then NAME=rssh-cli.exe; fi
-          cp "src-tauri/target/${TARGET}/release/${NAME}" src-tauri/bin/
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" app/tauri.conf.json
+          for manifest in app/Cargo.toml core/Cargo.toml cli/Cargo.toml; do
+            sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" "$manifest"
+          done
+          rm -f app/tauri.conf.json.bak app/Cargo.toml.bak core/Cargo.toml.bak cli/Cargo.toml.bak
 
       - name: Build Tauri app
         working-directory: ./app-src
-        run: npx tauri build --target ${{ matrix.target }}
+        run: npm run tauri -- build --target ${{ matrix.target }}
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
 
@@ -310,7 +303,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          BUNDLE="src-tauri/target/${TARGET}/release/bundle/appimage"
+          BUNDLE="target/${TARGET}/release/bundle/appimage"
           APPIMAGES=()
           while IFS= read -r appimage; do
             APPIMAGES+=("$appimage")
@@ -356,7 +349,7 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           PREFIX="rssh-${VERSION}-${OS_NAME}-${ARCH}"
-          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+          BUNDLE="target/${TARGET}/release/bundle"
           mkdir -p release-assets
 
           copy_one() {
@@ -403,7 +396,7 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           PORTABLE="rssh-${VERSION}-windows-x86_64-portable"
-          REL="src-tauri/target/${TARGET}/release"
+          REL="target/${TARGET}/release"
           mkdir -p "$PORTABLE"
           cp "${REL}/rssh.exe" "$PORTABLE/"
           cp "${REL}/rssh-cli.exe" "$PORTABLE/"
@@ -424,12 +417,12 @@ jobs:
 
       - name: Build rssh-server for JetBrains plugin
         shell: bash
-        working-directory: ./app-src/src-tauri
+        working-directory: ./app-src
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo build --release --features server --bin rssh-server --target "$TARGET"
+          cargo build --release -p rssh-app --features server --bin rssh-server --target "$TARGET"
 
       - name: Build and collect JetBrains plugin
         shell: bash
@@ -444,7 +437,7 @@ jobs:
           VERSION="${UPSTREAM_TAG#v}"
           BIN=rssh-server
           if [[ "$TARGET" == *windows* ]]; then BIN=rssh-server.exe; fi
-          SERVER="$PWD/src-tauri/target/${TARGET}/release/${BIN}"
+          SERVER="$PWD/target/${TARGET}/release/${BIN}"
           if [ ! -s "$SERVER" ]; then
             echo "::error::缺少 JetBrains 插件所需的 rssh-server: $SERVER"
             exit 1
@@ -515,7 +508,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: app-src/src-tauri
+          workspaces: app-src
 
       - name: Setup Android SDK and NDK
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
@@ -536,16 +529,18 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
-          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
-          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" app/tauri.conf.json
+          for manifest in app/Cargo.toml core/Cargo.toml cli/Cargo.toml; do
+            sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" "$manifest"
+          done
+          rm -f app/tauri.conf.json.bak app/Cargo.toml.bak core/Cargo.toml.bak cli/Cargo.toml.bak
 
       - name: Disable Gradle signing for isolated release signing
         shell: bash
         working-directory: ./app-src
         run: |
           set -euo pipefail
-          GRADLE_FILE=src-tauri/gen/android/app/build.gradle.kts
+          GRADLE_FILE=android/app/build.gradle.kts
           SIGNING_LINE='signingConfig = signingConfigs.getByName("release")'
           if ! grep -Fq "$SIGNING_LINE" "$GRADLE_FILE"; then
             echo "::error::无法定位 Android release 签名绑定，上游 Gradle 配置可能已变化"
@@ -553,10 +548,14 @@ jobs:
           fi
           sed -i.bak "/signingConfig = signingConfigs.getByName(\"release\")/d" "$GRADLE_FILE"
           rm -f "${GRADLE_FILE}.bak"
+          if [ -f app/gen/android/app/build.gradle.kts ]; then
+            sed -i.bak "/signingConfig = signingConfigs.getByName(\"release\")/d" app/gen/android/app/build.gradle.kts
+            rm -f app/gen/android/app/build.gradle.kts.bak
+          fi
 
       - name: Build Android universal APK
         working-directory: ./app-src
-        run: npx tauri android build --apk --target aarch64 armv7 --ci
+        run: npm run tauri -- android build --apk --target aarch64 armv7 --ci
 
       - name: Collect and verify unsigned Android signing input
         shell: bash
@@ -566,7 +565,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
-          APK=src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          APK=app/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
           if [ ! -s "$APK" ]; then
             echo "::error::缺少预期的未签名 universal release APK: $APK"
             exit 1
@@ -686,7 +685,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: app-src/src-tauri
+          workspaces: app-src
 
       - name: Install iOS build tools
         shell: bash
@@ -709,9 +708,11 @@ jobs:
             exit 1
           fi
           npm version "$VERSION" --no-git-tag-version --allow-same-version
-          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
-          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" src-tauri/Cargo.toml
-          rm -f src-tauri/tauri.conf.json.bak src-tauri/Cargo.toml.bak
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" app/tauri.conf.json
+          for manifest in app/Cargo.toml core/Cargo.toml cli/Cargo.toml; do
+            sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" "$manifest"
+          done
+          rm -f app/tauri.conf.json.bak app/Cargo.toml.bak core/Cargo.toml.bak cli/Cargo.toml.bak
 
       - name: Initialize and repair Tauri iOS project
         shell: bash
@@ -719,17 +720,22 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add aarch64-apple-ios
-          if [ ! -f src-tauri/gen/apple/project.yml ]; then
-            npx tauri ios init --ci --skip-targets-install
+          if [ ! -f app/gen/apple/project.yml ]; then
+            npm run tauri -- ios init --ci --skip-targets-install
           fi
 
-          PROJECT_YML=src-tauri/gen/apple/project.yml
+          PROJECT_YML=app/gen/apple/project.yml
           if grep -q 'script: npm run -- tauri ios xcode-script' "$PROJECT_YML"; then
             perl -0pi -e 's{script: npm run -- tauri ios xcode-script}{script: cd "\$\{SRCROOT\}/../../.." \&\& npm run -- tauri ios xcode-script}' "$PROJECT_YML"
           fi
-          cp src-tauri/PrivacyInfo.xcprivacy src-tauri/gen/apple/rssh_iOS/PrivacyInfo.xcprivacy
-          xcodegen generate --spec "$PROJECT_YML" --project src-tauri/gen/apple
-          cp src-tauri/icons/ios/*.png src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/
+          ios_targets=(app/gen/apple/*_iOS)
+          if [ "${#ios_targets[@]}" -ne 1 ] || [ ! -d "${ios_targets[0]}" ]; then
+            echo "::error::expected one generated iOS application target" >&2
+            exit 1
+          fi
+          cp ios/PrivacyInfo.xcprivacy "${ios_targets[0]}/PrivacyInfo.xcprivacy"
+          xcodegen generate --spec "$PROJECT_YML" --project app/gen/apple
+          cp icons/ios/*.png app/gen/apple/Assets.xcassets/AppIcon.appiconset/
           npm run build
 
       - name: Build unsigned iPhoneOS arm64 app and package IPA
@@ -746,16 +752,16 @@ jobs:
           # build and calling xcodebuild directly leaves the options file unset,
           # causing a panic inside xcode-script.
           # --no-sign: produce an unsigned .app, then Tauri packages an unsigned IPA.
-          npx tauri ios build --ci --target aarch64 --no-sign --build-number "$GITHUB_RUN_NUMBER"
+          npm run tauri -- ios build --ci --target aarch64 --no-sign --build-number "$GITHUB_RUN_NUMBER"
 
           # Locate the unsigned .app inside the xcarchive that Tauri produced.
           APPS=()
           while IFS= read -r app; do
             APPS+=("$app")
-          done < <(find src-tauri/gen/apple -type d -name '*.app' -path '*Products*Applications*' -print)
+          done < <(find app/gen/apple -type d -name '*.app' -path '*Products*Applications*' -print)
           if [ "${#APPS[@]}" -ne 1 ]; then
             echo "::error::预期 1 个真机 .app，实际 ${#APPS[@]} 个"
-            find src-tauri/gen/apple -type d -name '*.app' -print
+            find app/gen/apple -type d -name '*.app' -print
             exit 1
           fi
           APP_PATH="${APPS[0]}"
