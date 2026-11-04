@@ -1,0 +1,198 @@
+name: Build CloudBox iOS
+
+on:
+  schedule:
+    - cron: '47 4 * * 2,5'
+  workflow_dispatch:
+    inputs:
+      force_ref:
+        description: 'Optional tag, branch, or 40-char commit SHA override'
+        required: false
+        default: ''
+        type: string
+      publish_release:
+        description: 'Publish artifacts to private vault release'
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: cloudbox-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      should_skip: ${{ steps.coord.outputs.should_skip }}
+      upstream_tag: ${{ steps.coord.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.coord.outputs.upstream_sha }}
+      release_tag: ${{ steps.coord.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify public repository hygiene
+        shell: bash
+        run: bash .github/scripts/check-clean-public.sh
+
+      - name: Resolve version and run patch precheck
+        id: coord
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          FORCE_REF: ${{ inputs.force_ref }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'schedule' && 'true' || inputs.publish_release }}
+        run: bash .github/scripts/vault-api.sh prepare cloudbox-ios
+
+      - name: Encrypt transit kit and clean source archive
+        if: steps.coord.outputs.should_skip != 'true'
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/transit"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/kit" "$RUNNER_TEMP/transit/kit.enc"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/src-out" "$RUNNER_TEMP/transit/src.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-cloudbox-ios-kit
+          path: ${{ runner.temp }}/transit/kit.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-cloudbox-ios-src
+          path: ${{ runner.temp }}/transit/src.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_skip != 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-cloudbox-ios-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Build unsigned iOS package and encrypt output
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-ios-unsigned.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-ios.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-cloudbox-ios-pkg
+          path: ${{ runner.temp }}/transit/pkg-ios.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-and-publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: transit-cloudbox-ios-*
+          path: ${{ runner.temp }}/enc-in
+          merge-multiple: true
+
+      - name: Decrypt and verify unsigned arm64 IPA
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+
+          mkdir -p "$RUNNER_TEMP/release-assets" "$RUNNER_TEMP/raw-pkgs"
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/src.enc" "$RUNNER_TEMP/release-assets"
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/pkg-ios.enc" "$RUNNER_TEMP/raw-pkgs"
+
+          for item in "$RUNNER_TEMP/raw-pkgs"/*; do
+            base="$(basename "$item")"
+            case "$base" in
+              *-unsigned.ipa)
+                python3 .github/scripts/verify-unsigned-ipa.py "$item"
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+              *)
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+            esac
+          done
+
+          for gz in "$RUNNER_TEMP/release-assets"/*.tar.gz; do
+            gzip -t "$gz"
+          done
+          ( cd "$RUNNER_TEMP/release-assets" && sha256sum -- * > SHA256SUMS )
+
+      - name: Publish to private vault release
+        if: github.event_name == 'schedule' || inputs.publish_release == true
+        shell: bash
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          bash .github/scripts/vault-api.sh publish-release \
+            "$RUNNER_TEMP/kit/resolved.env" \
+            "$RUNNER_TEMP/kit/target/notes.md" \
+            "$RUNNER_TEMP/release-assets"
+
+  cleanup-transit:
+    needs: [prepare, build, sign-and-publish]
+    if: always() && needs.prepare.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete temporary encrypted transit artifacts
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/transit-crypto.sh purge-artifacts

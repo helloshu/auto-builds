@@ -1,0 +1,480 @@
+name: Build NoteSync
+
+on:
+  schedule:
+    - cron: '41 19 * * *'
+  workflow_dispatch:
+    inputs:
+      force_ref:
+        description: 'Optional tag or 40-char commit SHA override'
+        required: false
+        default: ''
+        type: string
+      platforms:
+        description: 'Comma-separated subset of: all,desktop,android,ios,docker'
+        required: false
+        default: 'all'
+        type: string
+      publish_release:
+        description: 'Publish artifacts to private vault release'
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: notesync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      should_skip: ${{ steps.coord.outputs.should_skip }}
+      upstream_tag: ${{ steps.coord.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.coord.outputs.upstream_sha }}
+      release_tag: ${{ steps.coord.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify public repository hygiene
+        shell: bash
+        run: bash .github/scripts/check-clean-public.sh
+
+      - name: Resolve version and run patch precheck
+        id: coord
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          FORCE_REF: ${{ inputs.force_ref }}
+          PLATFORMS: ${{ inputs.platforms || 'all' }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'schedule' && 'true' || inputs.publish_release }}
+        run: bash .github/scripts/vault-api.sh prepare notesync
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          go-version-file: ${{ runner.temp }}/precheck-src/kernel/go.mod
+          cache-dependency-path: ${{ runner.temp }}/precheck-src/kernel/go.sum
+
+      - name: Validate patched Go packages before fan-out
+        if: steps.coord.outputs.should_skip != 'true'
+        shell: bash
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          if ! bash "$RUNNER_TEMP/kit/target/scripts/check-go-patched.sh" "$RUNNER_TEMP/precheck-src" > "$RUNNER_TEMP/go-precheck.log" 2>&1; then
+            cat "$RUNNER_TEMP/go-precheck.log" >&2
+            bash .github/scripts/vault-api.sh report-issue notesync "patched Go compile check failed" "$RUNNER_TEMP/go-precheck.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/go-precheck.log"
+
+      - name: Encrypt transit kit and clean source archive
+        if: steps.coord.outputs.should_skip != 'true'
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/transit"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/kit" "$RUNNER_TEMP/transit/kit.enc"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/src-out" "$RUNNER_TEMP/transit/src.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-notesync-kit
+          path: ${{ runner.temp }}/transit/kit.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-notesync-src
+          path: ${{ runner.temp }}/transit/src.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build-desktop:
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.should_skip != 'true' &&
+      (
+        contains(format(',{0},', inputs.platforms || 'all'), ',all,') ||
+        contains(format(',{0},', inputs.platforms), ',desktop,')
+      )
+    name: desktop-${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux
+            os: ubuntu-24.04
+          - id: macos
+            os: macos-latest
+          - id: macos-arm64
+            os: macos-latest
+          - id: windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-notesync-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Decrypt kit and prepare patched upstream source
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ runner.temp }}/work/src/kernel/go.mod
+          cache-dependency-path: ${{ runner.temp }}/work/src/kernel/go.sum
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Build desktop package and encrypt output
+        shell: bash
+        env:
+          ROW_ID: ${{ matrix.id }}
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-desktop.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/out-stage" "$ROW_ID"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-desktop-${ROW_ID}.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-notesync-pkg-desktop-${{ matrix.id }}
+          path: ${{ runner.temp }}/transit/pkg-desktop-${{ matrix.id }}.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build-android:
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.should_skip != 'true' &&
+      (
+        contains(format(',{0},', inputs.platforms || 'all'), ',all,') ||
+        contains(format(',{0},', inputs.platforms), ',android,')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-notesync-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Decrypt kit and prepare patched upstream source
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ runner.temp }}/work/src/kernel/go.mod
+          cache-dependency-path: ${{ runner.temp }}/work/src/kernel/go.sum
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ns-gradle-${{ runner.os }}-${{ needs.prepare.outputs.upstream_sha }}
+          restore-keys: ns-gradle-${{ runner.os }}-
+
+      - name: Install Android NDK
+        shell: bash
+        run: bash .github/scripts/install-android-sdk.sh "ndk;28.2.13676358"
+
+      - name: Build Android APK with throwaway signing and encrypt output
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-android.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-android.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-notesync-pkg-android
+          path: ${{ runner.temp }}/transit/pkg-android.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build-ios:
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.should_skip != 'true' &&
+      (
+        contains(format(',{0},', inputs.platforms || 'all'), ',all,') ||
+        contains(format(',{0},', inputs.platforms), ',ios,')
+      )
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-notesync-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Decrypt kit and prepare patched upstream source
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ runner.temp }}/work/src/kernel/go.mod
+          cache-dependency-path: ${{ runner.temp }}/work/src/kernel/go.sum
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Build unsigned iOS IPA and encrypt output
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-ios-unsigned.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-ios.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-notesync-pkg-ios
+          path: ${{ runner.temp }}/transit/pkg-ios.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build-docker:
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.should_skip != 'true' &&
+      (
+        contains(format(',{0},', inputs.platforms || 'all'), ',all,') ||
+        contains(format(',{0},', inputs.platforms), ',docker,')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    permissions:
+      contents: read
+    steps:
+      - name: Reclaim unused runner disk space
+        shell: bash
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-notesync-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Build, verify, and encrypt importable Docker archive
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-docker-archive.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-docker.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-notesync-pkg-docker
+          path: ${{ runner.temp }}/transit/pkg-docker.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-and-publish:
+    needs: [prepare, build-desktop, build-android, build-ios, build-docker]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.should_skip != 'true' &&
+      (needs.build-desktop.result == 'success' || needs.build-desktop.result == 'skipped') &&
+      (needs.build-android.result == 'success' || needs.build-android.result == 'skipped') &&
+      (needs.build-ios.result == 'success' || needs.build-ios.result == 'skipped') &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped') &&
+      (
+        needs.build-desktop.result == 'success' ||
+        needs.build-android.result == 'success' ||
+        needs.build-ios.result == 'success' ||
+        needs.build-docker.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: transit-notesync-*
+          path: ${{ runner.temp }}/enc-in
+          merge-multiple: true
+
+      - name: Decrypt, verify, sign APK, and assemble release assets
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+          SIGN_B64: ${{ secrets.SIGN_NOTESYNC_B64 }}
+          KEYSTORE_PASS: ${{ secrets.SIGN_NOTESYNC_PASS }}
+          KEY_PASS: ${{ secrets.SIGN_NOTESYNC_PASS }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+
+          mkdir -p "$RUNNER_TEMP/release-assets" "$RUNNER_TEMP/raw-pkgs"
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/src.enc" "$RUNNER_TEMP/release-assets"
+
+          shopt -s nullglob
+          for pkg_enc in "$RUNNER_TEMP/enc-in"/pkg-*.enc; do
+            bash .github/scripts/transit-crypto.sh decrypt "$pkg_enc" "$RUNNER_TEMP/raw-pkgs"
+          done
+
+          ks_file="$RUNNER_TEMP/release.jks"
+          printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
+          trap 'rm -f "$ks_file"' EXIT
+
+          for item in "$RUNNER_TEMP/raw-pkgs"/*; do
+            base="$(basename "$item")"
+            case "$base" in
+              *-unsigned.apk)
+                final_name="${base%-unsigned.apk}.apk"
+                bash .github/scripts/sign-apk.sh "$item" "$RUNNER_TEMP/release-assets/${final_name}" "$ks_file" \
+                  --expected-sha256 "$EXPECTED_SIGNER_SHA256" \
+                  --expected-package "$APP_PACKAGE_ID"
+                ;;
+              *-unsigned.ipa)
+                python3 .github/scripts/verify-unsigned-ipa.py "$item"
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+              *)
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+            esac
+          done
+
+          for gz in "$RUNNER_TEMP/release-assets"/*.tar.gz; do
+            gzip -t "$gz"
+          done
+          ( cd "$RUNNER_TEMP/release-assets" && sha256sum -- * > SHA256SUMS )
+
+      - name: Publish to private vault release
+        if: github.event_name == 'schedule' || inputs.publish_release == true
+        shell: bash
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          bash .github/scripts/vault-api.sh publish-release \
+            "$RUNNER_TEMP/kit/resolved.env" \
+            "$RUNNER_TEMP/kit/target/notes.md" \
+            "$RUNNER_TEMP/release-assets"
+
+  cleanup-transit:
+    needs: [prepare, build-desktop, build-android, build-ios, build-docker, sign-and-publish]
+    if: always() && needs.prepare.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete temporary encrypted transit artifacts
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/transit-crypto.sh purge-artifacts

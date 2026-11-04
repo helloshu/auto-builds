@@ -1,0 +1,466 @@
+name: Build PassVault
+
+on:
+  schedule:
+    - cron: '23 3 * * 1,4'
+  workflow_dispatch:
+    inputs:
+      force_ref:
+        description: 'Optional tag, branch, or 40-char commit SHA override'
+        required: false
+        default: ''
+        type: string
+      platforms:
+        description: 'Comma-separated subset of: all,android,linux,windows,macos'
+        required: false
+        default: 'all'
+        type: string
+      include_ios:
+        description: 'Also run best-effort unsigned iOS build'
+        required: false
+        default: false
+        type: boolean
+      publish_release:
+        description: 'Publish artifacts to private vault release'
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: passvault-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SDK_PLATFORM: '37.1'
+  BUILD_TOOLS: '37.0.0'
+  NDK_VERSION: '27.0.12077973'
+  RUST_TOOLCHAIN: 'beta-2026-07-15'
+  RUST_ANDROID_TARGETS: 'aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android'
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx5g'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      should_skip: ${{ steps.coord.outputs.should_skip }}
+      upstream_tag: ${{ steps.coord.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.coord.outputs.upstream_sha }}
+      release_tag: ${{ steps.coord.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify public repository hygiene
+        shell: bash
+        run: bash .github/scripts/check-clean-public.sh
+
+      - name: Resolve version and run patch precheck
+        id: coord
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          FORCE_REF: ${{ inputs.force_ref }}
+          PLATFORMS: ${{ inputs.platforms || 'all' }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'schedule' && 'true' || inputs.publish_release }}
+        run: bash .github/scripts/vault-api.sh prepare passvault
+
+      - name: Encrypt transit kit and clean source archive
+        if: steps.coord.outputs.should_skip != 'true'
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/transit"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/kit" "$RUNNER_TEMP/transit/kit.enc"
+          bash .github/scripts/transit-crypto.sh encrypt "$RUNNER_TEMP/src-out" "$RUNNER_TEMP/transit/src.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-passvault-kit
+          path: ${{ runner.temp }}/transit/kit.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.coord.outputs.should_skip != 'true'
+        with:
+          name: transit-passvault-src
+          path: ${{ runner.temp }}/transit/src.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_skip != 'true'
+    name: build-${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: android
+            os: ubuntu-latest
+            tasks: ':androidApp:assembleNoneRelease'
+          - id: linux-deb
+            os: ubuntu-latest
+            tasks: ':desktopApp:packageReleaseDeb'
+          - id: linux-packages
+            os: ubuntu-latest
+            tasks: ''
+          - id: windows
+            os: windows-latest
+            tasks: ':desktopApp:packageReleaseMsi'
+          - id: macos
+            os: macos-15
+            tasks: ':desktopApp:packageReleaseDmg'
+    steps:
+      - name: Check platform selection
+        id: gate
+        shell: bash
+        env:
+          WANT_PLATFORMS: ${{ inputs.platforms || 'all' }}
+          ROW_ID: ${{ matrix.id }}
+        run: |
+          run_row=false
+          case ",${WANT_PLATFORMS}," in
+            *,all,*|*,${ROW_ID},*) run_row=true ;;
+          esac
+          case "${ROW_ID}" in
+            linux-*)
+              case ",${WANT_PLATFORMS}," in *,linux,*) run_row=true ;; esac
+              ;;
+          esac
+          echo "run=${run_row}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: transit-passvault-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Decrypt build kit and mask identifiers
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Gradle and Kotlin
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.konan
+          key: pv-gradle-${{ runner.os }}-${{ needs.prepare.outputs.upstream_sha }}
+          restore-keys: pv-gradle-${{ runner.os }}-
+
+      - name: Install Android SDK and NDK
+        if: steps.gate.outputs.run == 'true' && matrix.id == 'android'
+        shell: bash
+        run: bash .github/scripts/install-android-sdk.sh "platforms;android-${SDK_PLATFORM}" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}"
+
+      - name: Install Windows WiX toolset
+        if: steps.gate.outputs.run == 'true' && matrix.id == 'windows'
+        shell: bash
+        run: choco install wixtoolset --no-progress -y
+
+      - name: Fetch pinned upstream source and apply patches
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+
+      - name: Install Linux desktop libraries
+        if: steps.gate.outputs.run == 'true' && startsWith(matrix.id, 'linux')
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxrender-dev libxtst-dev libxi-dev libxkbcommon-dev \
+            libudev-dev libpcsclite-dev libgtk-3-0 xvfb \
+            desktop-file-utils zsync
+
+      - name: Install protobuf compiler
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          case "${RUNNER_OS}" in
+            Linux)   sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
+            macOS)   brew install protobuf ;;
+            Windows) choco install protoc --no-progress -y ;;
+          esac
+          protoc --version
+
+      - name: Set up Rust toolchain
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          ROW_ID: ${{ matrix.id }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup component add --toolchain "$RUST_TOOLCHAIN" clippy rustfmt
+          if [ "$ROW_ID" = "android" ]; then
+            for target_arch in $RUST_ANDROID_TARGETS; do
+              rustup target add --toolchain "$RUST_TOOLCHAIN" "$target_arch"
+            done
+          fi
+
+      - name: Cache Cargo dependencies
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+          key: pv-cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ needs.prepare.outputs.upstream_sha }}
+          restore-keys: pv-cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Configure throwaway Android build keystore
+        if: steps.gate.outputs.run == 'true' && matrix.id == 'android'
+        shell: bash
+        run: bash "$RUNNER_TEMP/kit/target/scripts/install-throwaway-signing.sh" "$RUNNER_TEMP/work/src"
+
+      - name: Build Linux AppImage and optional Flatpak
+        if: steps.gate.outputs.run == 'true' && matrix.id == 'linux-packages'
+        shell: bash
+        run: bash "$RUNNER_TEMP/kit/target/scripts/package-linux-extras.sh" "$RUNNER_TEMP/work/src"
+
+      - name: Build platform package
+        if: steps.gate.outputs.run == 'true' && matrix.id != 'linux-packages'
+        shell: bash
+        working-directory: ${{ runner.temp }}/work/src
+        env:
+          ROW_ID: ${{ matrix.id }}
+          GRADLE_TASK: ${{ matrix.tasks }}
+          EXTRA_GRADLE_ARGS: ${{ startsWith(matrix.id, 'linux') && '-x createReleaseAotArchive -x prepareBundledAppResources' || '' }}
+          GRADLE_JVMARGS: ${{ matrix.id == 'android' && '-Dorg.gradle.jvmargs=-Xmx8g --max-workers=4' || '--max-workers=4' }}
+        run: |
+          case "$ROW_ID" in
+            linux-*) ./gradlew :desktopApp:prepareBundledAppResources ;;
+          esac
+          # shellcheck disable=SC2086
+          ./gradlew ${EXTRA_GRADLE_ARGS} "$GRADLE_TASK" \
+            -Pbuildkonfig.flavor=release \
+            -PversionRef=local \
+            --console=plain --stacktrace \
+            ${GRADLE_JVMARGS}
+
+      - name: Stage and encrypt platform outputs
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          ROW_ID: ${{ matrix.id }}
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/collect-outputs.sh" \
+            "$ROW_ID" "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-${ROW_ID}.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: transit-passvault-pkg-${{ matrix.id }}
+          path: ${{ runner.temp }}/transit/pkg-${{ matrix.id }}.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  build-ios:
+    needs: prepare
+    if: needs.prepare.outputs.should_skip != 'true' && inputs.include_ios == true
+    runs-on: macos-15
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: transit-passvault-kit
+          path: ${{ runner.temp }}/dl
+
+      - name: Decrypt build kit
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust and XcodeGen tools
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          for target_arch in aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin; do
+            rustup target add --toolchain "$RUST_TOOLCHAIN" "$target_arch"
+          done
+          brew install protobuf xcodegen
+
+      - name: Build unsigned iOS package
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+        run: |
+          bash "$RUNNER_TEMP/kit/scripts/prepare-upstream.sh" \
+            "$RUNNER_TEMP/kit/target" "$RUNNER_TEMP/work/src" \
+            --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
+          mkdir -p "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit"
+          bash "$RUNNER_TEMP/kit/target/scripts/build-ios-unsigned.sh" \
+            "$RUNNER_TEMP/work/src" "$RUNNER_TEMP/out-stage" "$UPSTREAM_TAG"
+          bash .github/scripts/transit-crypto.sh encrypt \
+            "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-ios.enc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transit-passvault-pkg-ios
+          path: ${{ runner.temp }}/transit/pkg-ios.enc
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-and-publish:
+    needs: [prepare, build, build-ios]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.should_skip != 'true' &&
+      needs.build.result == 'success' &&
+      (needs.build-ios.result == 'success' || needs.build-ios.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: transit-passvault-*
+          path: ${{ runner.temp }}/enc-in
+          merge-multiple: true
+
+      - name: Decrypt, verify, sign APK, and assemble release assets
+        shell: bash
+        env:
+          TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
+          SIGN_B64: ${{ secrets.SIGN_PASSVAULT_B64 }}
+          KEYSTORE_PASS: ${{ secrets.SIGN_PASSVAULT_PASS }}
+          KEY_PASS: ${{ secrets.SIGN_PASSVAULT_KEY_PASS }}
+        run: |
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/kit.enc" "$RUNNER_TEMP/kit"
+          bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+
+          mkdir -p "$RUNNER_TEMP/release-assets" "$RUNNER_TEMP/raw-pkgs"
+          bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/src.enc" "$RUNNER_TEMP/release-assets"
+
+          shopt -s nullglob
+          for pkg_enc in "$RUNNER_TEMP/enc-in"/pkg-*.enc; do
+            bash .github/scripts/transit-crypto.sh decrypt "$pkg_enc" "$RUNNER_TEMP/raw-pkgs"
+          done
+
+          if [ ! -d "${ANDROID_HOME}/build-tools" ]; then
+            bash .github/scripts/install-android-sdk.sh "build-tools;${BUILD_TOOLS}"
+          fi
+
+          ks_file="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
+          trap 'rm -f "$ks_file"' EXIT
+
+          for item in "$RUNNER_TEMP/raw-pkgs"/*; do
+            base="$(basename "$item")"
+            case "$base" in
+              *-unsigned.apk)
+                final_name="${base%-unsigned.apk}.apk"
+                bash .github/scripts/sign-apk.sh "$item" "$RUNNER_TEMP/release-assets/${final_name}" "$ks_file" \
+                  --expected-sha256 "$EXPECTED_SIGNER_SHA256" \
+                  --expected-package "$APP_PACKAGE_ID"
+                ;;
+              *-unsigned.ipa)
+                python3 .github/scripts/verify-unsigned-ipa.py "$item"
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+              *)
+                cp "$item" "$RUNNER_TEMP/release-assets/$base"
+                ;;
+            esac
+          done
+
+          for gz in "$RUNNER_TEMP/release-assets"/*.tar.gz; do
+            gzip -t "$gz"
+          done
+          ( cd "$RUNNER_TEMP/release-assets" && sha256sum -- * > SHA256SUMS )
+
+      - name: Publish to private vault release
+        if: github.event_name == 'schedule' || inputs.publish_release == true
+        shell: bash
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          bash .github/scripts/vault-api.sh publish-release \
+            "$RUNNER_TEMP/kit/resolved.env" \
+            "$RUNNER_TEMP/kit/target/notes.md" \
+            "$RUNNER_TEMP/release-assets"
+
+  cleanup-transit:
+    needs: [prepare, build, build-ios, sign-and-publish]
+    if: always() && needs.prepare.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Delete temporary encrypted transit artifacts
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/transit-crypto.sh purge-artifacts
