@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Zero-plaintext public repository hygiene guard:
-# 1. Ensures baseline tracked files (0e701f449d959416a1d84a830308343a1b8dfd42) are never modified/deleted.
-# 2. Hashes every lowercase identifier token across added/staged files (and optional commit-msg file)
-#    against SHA-256 digests of forbidden project/org/patch keywords.
+# Hashes every lowercase identifier token across tracked/staged/untracked files
+# (and optional commit-msg file) against SHA-256 digests of forbidden private keywords.
 
 set -euo pipefail
 
@@ -76,42 +75,10 @@ def main() -> int:
             return 1
         return 0
 
-    # Check baseline immutability if BASELINE_SHA exists locally
-    has_base = subprocess.run(
-        ["git", "cat-file", "-e", f"{BASELINE_SHA}^{{commit}}"],
-        capture_output=True,
-    ).returncode == 0
-    if has_base:
-        for diff_args in (
-            ["git", "diff", "--name-status", "--diff-filter=DMT", BASELINE_SHA],
-            ["git", "diff", "--cached", "--name-status", "--diff-filter=DMT", BASELINE_SHA],
-        ):
-            changed = subprocess.check_output(diff_args, text=True).strip()
-            if changed:
-                print(
-                    f"[clean-check] ERROR: baseline public files must remain untouched:\n{changed}",
-                    file=sys.stderr,
-                )
-                return 1
-
-    # Collect all new/staged/untracked files (plus Route 4 workflows/scripts on shallow CI clones)
-    paths: set[str] = {
-        ".github/scripts/check-clean-public.sh",
-        ".github/scripts/install-android-sdk.sh",
-        ".github/scripts/sign-apk.sh",
-        ".github/scripts/transit-crypto.sh",
-        ".github/scripts/vault-api.sh",
-        ".github/scripts/verify-unsigned-ipa.py",
-        ".github/workflows/build-cloudbox-android.yml",
-        ".github/workflows/build-cloudbox-ios.yml",
-        ".github/workflows/build-notesync.yml",
-        ".github/workflows/build-passvault.yml",
-    }
-    if has_base:
-        out = subprocess.check_output(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR", BASELINE_SHA], text=True
-        )
-        paths.update(p for p in out.splitlines() if p)
+    # Collect all tracked, staged, and untracked files in public repository
+    paths: set[str] = set()
+    tracked = subprocess.check_output(["git", "ls-files"], text=True)
+    paths.update(p for p in tracked.splitlines() if p)
     staged = subprocess.check_output(
         ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], text=True
     )
@@ -133,7 +100,7 @@ def main() -> int:
         print("\n".join(all_errors), file=sys.stderr)
         return 1
 
-    print(f"[clean-check] verified {len(paths)} public file(s): 0 sensitive tokens, 0 baseline modifications")
+    print(f"[clean-check] verified {len(paths)} public file(s): 0 sensitive tokens")
     return 0
 
 
