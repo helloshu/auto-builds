@@ -82,7 +82,7 @@ jobs:
   build:
     needs: prepare
     if: needs.prepare.outputs.should_skip != 'true'
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 60
     permissions:
       contents: read
