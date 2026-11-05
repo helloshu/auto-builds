@@ -93,8 +93,19 @@ def main() -> int:
                 )
                 return 1
 
-    # Collect all new/staged/untracked files to scan
-    paths: set[str] = set()
+    # Collect all new/staged/untracked files (plus Route 4 workflows/scripts on shallow CI clones)
+    paths: set[str] = {
+        ".github/scripts/check-clean-public.sh",
+        ".github/scripts/install-android-sdk.sh",
+        ".github/scripts/sign-apk.sh",
+        ".github/scripts/transit-crypto.sh",
+        ".github/scripts/vault-api.sh",
+        ".github/scripts/verify-unsigned-ipa.py",
+        ".github/workflows/build-cloudbox-android.yml",
+        ".github/workflows/build-cloudbox-ios.yml",
+        ".github/workflows/build-notesync.yml",
+        ".github/workflows/build-passvault.yml",
+    }
     if has_base:
         out = subprocess.check_output(
             ["git", "diff", "--name-only", "--diff-filter=ACMR", BASELINE_SHA], text=True

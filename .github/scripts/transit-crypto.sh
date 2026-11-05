@@ -153,7 +153,8 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 def cmd_load_env(env_file_str: str, export_gh: bool) -> None:
-    values = parse_env_file(Path(env_file_str))
+    env_path = Path(env_file_str).resolve()
+    values = parse_env_file(env_path)
     to_mask: set[str] = set()
     for field in ("UPSTREAM_REPO", "DISPLAY_NAME", "ANDROID_REPO", "IOS_REPO"):
         val = values.get(field, "").strip()
@@ -166,14 +167,19 @@ def cmd_load_env(env_file_str: str, export_gh: bool) -> None:
     for item in sorted(to_mask):
         print(f"::add-mask::{item}", flush=True)
 
+    exports_lines = []
+    for k, v in sorted(values.items()):
+        if "\n" in v:
+            raise SystemExit(f"ERROR: multiline value in {k}")
+        exports_lines.append(f"export {k}={shlex.quote(v)}")
+    (env_path.parent / "exports.sh").write_text("\n".join(exports_lines) + "\n", encoding="utf-8")
+
     if export_gh:
         gh_env = os.environ.get("GITHUB_ENV")
         if not gh_env:
             raise SystemExit("ERROR: GITHUB_ENV is not set")
         with open(gh_env, "a", encoding="utf-8") as fh:
-            for k, v in values.items():
-                if "\n" in v:
-                    raise SystemExit(f"ERROR: multiline value in {k}")
+            for k, v in sorted(values.items()):
                 fh.write(f"{k}={v}\n")
 
 

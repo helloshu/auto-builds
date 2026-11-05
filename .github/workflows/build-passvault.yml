@@ -163,6 +163,8 @@ jobs:
         run: |
           bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
           bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          # shellcheck disable=SC1091
+          . "$RUNNER_TEMP/kit/exports.sh"
 
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         if: steps.gate.outputs.run == 'true'
@@ -320,6 +322,8 @@ jobs:
         run: |
           bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/dl/kit.enc" "$RUNNER_TEMP/kit"
           bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          # shellcheck disable=SC1091
+          . "$RUNNER_TEMP/kit/exports.sh"
 
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
@@ -394,6 +398,8 @@ jobs:
         run: |
           bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/kit.enc" "$RUNNER_TEMP/kit"
           bash .github/scripts/transit-crypto.sh load-env "$RUNNER_TEMP/kit/resolved.env" --export-github-env
+          # shellcheck disable=SC1091
+          . "$RUNNER_TEMP/kit/exports.sh"
 
           mkdir -p "$RUNNER_TEMP/release-assets" "$RUNNER_TEMP/raw-pkgs"
           bash .github/scripts/transit-crypto.sh decrypt "$RUNNER_TEMP/enc-in/src.enc" "$RUNNER_TEMP/release-assets"

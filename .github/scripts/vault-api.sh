@@ -320,8 +320,10 @@ def write_gh_output(pairs: dict[str, str]) -> None:
 
 
 def cmd_prepare(target_id: str) -> None:
-    vault_repo = os.environ["VAULT_REPO"].strip()
-    vault_token = os.environ["VAULT_TOKEN"].strip()
+    vault_repo = os.environ.get("VAULT_REPO", "").strip()
+    vault_token = os.environ.get("VAULT_TOKEN", "").strip()
+    if not vault_repo or not vault_token:
+        raise SystemExit("ERROR: VAULT_REPO and VAULT_TOKEN secrets must be configured on this repository")
     public_token = os.environ.get("GITHUB_TOKEN", "").strip()
     force_ref = os.environ.get("FORCE_REF", "").strip()
     platforms = os.environ.get("PLATFORMS", "all").strip()
