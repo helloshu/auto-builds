@@ -44,6 +44,7 @@ FORBIDDEN_TOKEN_SHA256 = {
     "38d0bbee4973f1b6cf99aaf02f12a4e64ccf6c6e8d14ca68dbe6b4c2cff918d2",
     "590d11d79ad65f8cabd0c2d129d8dd7e660040bbc9198b422415b4b4fc42ebf5",
     "f326395de2edff401a454ca12ddc4a1b65f2170a4c28a000812624c5ff7b4ae5",
+    "090bb0fbea66b20a17d6a2a3808340ba7628d167e3b6786655fc694cb9b4bc22",
 }
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
