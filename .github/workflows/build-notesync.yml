@@ -11,7 +11,7 @@ on:
         default: ''
         type: string
       platforms:
-        description: 'Comma-separated subset of: all,desktop,android,ios,docker'
+        description: 'Comma-separated subset of: all,desktop,linux,macos,macos-arm64,windows,android,ios,docker'
         required: false
         default: 'all'
         type: string
@@ -111,11 +111,15 @@ jobs:
       needs.prepare.outputs.should_skip != 'true' &&
       (
         contains(format(',{0},', inputs.platforms || 'all'), ',all,') ||
-        contains(format(',{0},', inputs.platforms), ',desktop,')
+        contains(format(',{0},', inputs.platforms), ',desktop,') ||
+        contains(format(',{0},', inputs.platforms), ',linux,') ||
+        contains(format(',{0},', inputs.platforms), ',macos,') ||
+        contains(format(',{0},', inputs.platforms), ',macos-arm64,') ||
+        contains(format(',{0},', inputs.platforms), ',windows,')
       )
     name: desktop-${{ matrix.id }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -131,16 +135,32 @@ jobs:
           - id: windows
             os: windows-latest
     steps:
+      - name: Check platform selection
+        id: gate
+        shell: bash
+        env:
+          WANT_PLATFORMS: ${{ inputs.platforms || 'all' }}
+          ROW_ID: ${{ matrix.id }}
+        run: |
+          run_row=false
+          case ",${WANT_PLATFORMS}," in
+            *,all,*|*,desktop,*|*,${ROW_ID},*) run_row=true ;;
+          esac
+          echo "run=${run_row}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.gate.outputs.run == 'true'
         with:
           persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.gate.outputs.run == 'true'
         with:
           name: transit-notesync-kit
           path: ${{ runner.temp }}/dl
 
       - name: Decrypt kit and prepare patched upstream source
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         env:
           TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
@@ -154,15 +174,18 @@ jobs:
             --sha "$UPSTREAM_SHA" --tag "$UPSTREAM_TAG"
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: steps.gate.outputs.run == 'true'
         with:
           go-version-file: ${{ runner.temp }}/work/src/kernel/go.mod
           cache-dependency-path: ${{ runner.temp }}/work/src/kernel/go.sum
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.gate.outputs.run == 'true'
         with:
           node-version: '24'
 
       - name: Build desktop package and encrypt output
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         env:
           ROW_ID: ${{ matrix.id }}
@@ -175,6 +198,7 @@ jobs:
             "$RUNNER_TEMP/out-stage" "$RUNNER_TEMP/transit/pkg-desktop-${ROW_ID}.enc"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.gate.outputs.run == 'true'
         with:
           name: transit-notesync-pkg-desktop-${{ matrix.id }}
           path: ${{ runner.temp }}/transit/pkg-desktop-${{ matrix.id }}.enc
