@@ -1,0 +1,488 @@
+name: DSH Desktop Auto Build
+
+on:
+  schedule:
+    - cron: '33 19 * * *' # 每天北京时间 03:33，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '强制编译指定的 Tag 版本 (例如: v2.0.22-next)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-dsh-desktop
+  cancel-in-progress: false
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+  YARN_ENABLE_HARDENED_MODE: 'false'
+  YARN_ENABLE_TELEMETRY: '0'
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-24.04
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
+    steps:
+      - name: Compare version with upstream
+        id: compare
+        shell: bash
+        env:
+          APP_ID: dsh-desktop
+          FORCE_TAG: ${{ inputs.force_tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: anywhere-labs/dsh-desktop
+        run: |
+          set -euo pipefail
+
+          # 仅跟踪 Next 发布通道（x.y.z-next，非预发布）。
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+-next$'
+
+          if [ -n "$FORCE_TAG" ]; then
+            UPSTREAM_TAG="$FORCE_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50" \
+              --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name' \
+              | grep -E "$TAG_RE" \
+              | sort -V \
+              | tail -n 1 || true)
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_TAG" =~ $TAG_RE ]]; then
+            echo "::error::上游标签 ${UPSTREAM_TAG} 不符合 Next 通道格式 vX.Y.Z-next"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FORCE_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anywhere-labs/dsh-desktop
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: dsh-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="DSH-NEXT-${VERSION}-source"
+          mkdir -p source-assets
+          git -C dsh-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-dsh-desktop
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build-linux:
+    name: Build (linux-${{ matrix.arch }})
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Reclaim unused runner disk space
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+
+      - name: Checkout immutable upstream commit (with pinned submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anywhere-labs/dsh-desktop
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: dsh-src
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.23.2'
+
+      - name: Enable Corepack and install dependencies
+        working-directory: ./dsh-src
+        run: |
+          corepack enable
+          yarn install --immutable
+
+      - name: Prepare shared release inputs
+        working-directory: ./dsh-src
+        run: |
+          yarn market:prepare
+          yarn aa:prepare-release
+          yarn workspace dsh-community-market build
+          yarn workspace dsh-desktop-next check:linux-package:platform
+
+      - name: Package Linux artifacts
+        working-directory: ./dsh-src
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+        run: yarn workspace dsh-desktop-next dist:linux
+
+      - name: Collect and verify platform artifacts
+        shell: bash
+        working-directory: ./dsh-src/dsh-desktop-next
+        env:
+          ARCH: ${{ matrix.arch }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          echo "== dist listing =="
+          find dist -maxdepth 3 -type f \( -name 'DSH-NEXT-*' \) -printf '%p (%s bytes)\n' | sort
+
+          case "$ARCH" in
+            x64)
+              EXPECTED=(
+                "DSH-NEXT-${VERSION}-amd64.deb"
+                "DSH-NEXT-${VERSION}-x86_64.AppImage"
+                "DSH-NEXT-${VERSION}-linux-x64.tar.gz"
+              )
+              ;;
+            arm64)
+              EXPECTED=(
+                "DSH-NEXT-${VERSION}-arm64.deb"
+                "DSH-NEXT-${VERSION}-arm64.AppImage"
+                "DSH-NEXT-${VERSION}-linux-arm64.tar.gz"
+              )
+              ;;
+          esac
+
+          mkdir -p ../release-assets
+          for name in "${EXPECTED[@]}"; do
+            MATCH=$(find dist -maxdepth 3 -type f -name "$name" | head -n 1)
+            if [ -z "$MATCH" ] || [ ! -s "$MATCH" ]; then
+              echo "::error::缺少预期产物: $name"
+              exit 1
+            fi
+            cp "$MATCH" ../release-assets/
+          done
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dsh-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-windows:
+    name: Build (windows-x64)
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout immutable upstream commit (with pinned submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anywhere-labs/dsh-desktop
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: dsh-src
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.23.2'
+
+      - name: Enable Corepack and resolve the upstream toolchain
+        working-directory: ./dsh-src
+        run: |
+          corepack enable
+          yarn upstream:version
+
+      - name: Install dependencies
+        working-directory: ./dsh-src
+        run: yarn install --immutable
+
+      - name: Prepare shared release inputs
+        working-directory: ./dsh-src
+        run: |
+          yarn market:prepare
+          yarn aa:prepare-release
+          yarn aa:prepare-release --verify-release
+          yarn workspace dsh-community-market build
+          yarn workspace dsh-desktop-next check:win-package:platform
+
+      - name: Build Windows installer
+        working-directory: ./dsh-src
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+        run: yarn workspace dsh-desktop-next dist:win
+
+      - name: Build Windows portable archive
+        working-directory: ./dsh-src
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_WINDOWS_REUSE_UNPACKED: '1'
+        run: yarn workspace dsh-desktop-next dist:win-portable
+
+      - name: Collect and verify platform artifacts
+        shell: bash
+        working-directory: ./dsh-src/dsh-desktop-next
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          echo "== dist listing =="
+          find dist -maxdepth 3 -type f \( -name 'DSH-NEXT-*' \) -printf '%p (%s bytes)\n' | sort
+
+          mkdir -p ../release-assets
+          for name in \
+            "DSH-NEXT-${VERSION}-x64-Setup.exe" \
+            "DSH-NEXT-${VERSION}-x64-Portable.zip"; do
+            MATCH=$(find dist -maxdepth 3 -type f -name "$name" | head -n 1)
+            if [ -z "$MATCH" ] || [ ! -s "$MATCH" ]; then
+              echo "::error::缺少预期产物: $name"
+              exit 1
+            fi
+            cp "$MATCH" ../release-assets/
+          done
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows-x64
+          path: dsh-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-macos:
+    name: Build (macos-universal)
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit (with pinned submodules)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anywhere-labs/dsh-desktop
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: dsh-src
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.23.2'
+
+      - name: Enable Corepack and install dependencies
+        working-directory: ./dsh-src
+        run: |
+          corepack enable
+          yarn install --immutable
+
+      - name: Prepare shared release inputs
+        working-directory: ./dsh-src
+        run: |
+          yarn market:prepare
+          yarn aa:prepare-release
+          yarn workspace dsh-community-market build
+          yarn workspace dsh-desktop-next check:mac-package:platform
+
+      # 无签名/公证的通用（Intel + Apple Silicon）DMG：上游正式发布在带证书的本机签名，此处使用其 mac-smoke 打包路径。
+      - name: Build unsigned universal DMG
+        working-directory: ./dsh-src
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          DSH_MAC_SMOKE_ARCH: universal
+          DSH_MAC_SMOKE_TARGET: dmg
+        run: yarn workspace dsh-desktop-next dist:mac-smoke
+
+      - name: Collect and verify platform artifacts
+        shell: bash
+        working-directory: ./dsh-src/dsh-desktop-next
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          echo "== dist listing =="
+          find dist -maxdepth 3 -type f -name '*.dmg' -print
+
+          mkdir -p ../release-assets
+          NAME="DSH-NEXT-${VERSION}-universal.dmg"
+          MATCH=$(find dist -maxdepth 3 -type f -name "$NAME" | head -n 1)
+          if [ -z "$MATCH" ]; then
+            # 兜底：仅有一个 dmg 时重命名为约定文件名
+            COUNT=$(find dist -maxdepth 3 -type f -name '*.dmg' | wc -l | tr -d ' ')
+            if [ "$COUNT" -eq 1 ]; then
+              MATCH=$(find dist -maxdepth 3 -type f -name '*.dmg' | head -n 1)
+            fi
+          fi
+          if [ -z "$MATCH" ] || [ ! -s "$MATCH" ]; then
+            echo "::error::缺少预期产物: $NAME"
+            exit 1
+          fi
+          cp "$MATCH" "../release-assets/$NAME"
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-macos-universal
+          path: dsh-src/release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, archive-source, build-linux, build-windows, build-macos]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "DSH-NEXT-${VERSION}-amd64.deb"
+            "DSH-NEXT-${VERSION}-x86_64.AppImage"
+            "DSH-NEXT-${VERSION}-linux-x64.tar.gz"
+            "DSH-NEXT-${VERSION}-arm64.deb"
+            "DSH-NEXT-${VERSION}-arm64.AppImage"
+            "DSH-NEXT-${VERSION}-linux-arm64.tar.gz"
+            "DSH-NEXT-${VERSION}-x64-Setup.exe"
+            "DSH-NEXT-${VERSION}-x64-Portable.zip"
+            "DSH-NEXT-${VERSION}-universal.dmg"
+            "DSH-NEXT-${VERSION}-source.tar.gz"
+          )
+
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: DSH NEXT ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated unsigned build of [anywhere-labs/dsh-desktop ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/anywhere-labs/dsh-desktop/releases/tag/${{ needs.check-version.outputs.upstream_tag }}) (Next channel).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            Linux (x64 / arm64: AppImage, deb, tar.gz), Windows x64 (NSIS installer + portable zip) and macOS universal (unsigned, not notarized DMG).
+            The source archive contains tracked files of the upstream repository only; pinned submodules are fetched from their upstream repositories at build time.
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
+
+            DSH NEXT is a community-maintained open-source project and is not an official DeepSeek product.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
