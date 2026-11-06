@@ -501,9 +501,38 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def download_asset_text(vault_repo: str, vault_token: str, asset_id: int) -> str:
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{vault_repo}/releases/assets/{asset_id}",
+        headers={
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {vault_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "auto-builds-vault-coordinator",
+        },
+        method="GET",
+    )
+    try:
+        with opener.open(req, timeout=120) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as err:
+        if err.code in (301, 302, 303, 307, 308):
+            loc = err.headers.get("Location")
+            if loc:
+                with urllib.request.urlopen(loc, timeout=120) as resp2:
+                    return resp2.read().decode("utf-8", errors="replace")
+        raise
+
+
 def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_str: str) -> None:
     vault_repo = os.environ["VAULT_REPO"].strip()
     vault_token = os.environ["VAULT_TOKEN"].strip()
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     mask(vault_repo)
 
     cfg = parse_env_file(Path(resolved_env_str))
@@ -533,31 +562,54 @@ def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_s
     )
     rel_id = rel["id"]
     is_draft = bool(rel.get("draft"))
+    allow_replace = is_draft or (event_name == "workflow_dispatch")
     existing_assets = {a["name"]: a for a in clean_starter_assets(vault_repo, vault_token, rel)}
 
+    merged_digests: dict[str, str] = {}
+    need_fallback_sums = False
+    for name, asset in existing_assets.items():
+        if name == "SHA256SUMS" or asset.get("state") != "uploaded":
+            continue
+        remote_digest = (asset.get("digest") or "").removeprefix("sha256:")
+        if re.fullmatch(r"[0-9a-f]{64}", remote_digest):
+            merged_digests[name] = remote_digest
+        else:
+            need_fallback_sums = True
+
+    if need_fallback_sums and "SHA256SUMS" in existing_assets:
+        raw_sums = download_asset_text(vault_repo, vault_token, existing_assets["SHA256SUMS"]["id"])
+        for ln in raw_sums.splitlines():
+            parts = ln.strip().split(None, 1)
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                fname = parts[1].lstrip("* ").strip()
+                if fname in existing_assets and fname != "SHA256SUMS":
+                    merged_digests.setdefault(fname, parts[0])
+
     assets_dir = Path(assets_dir_str).resolve()
-    files = sorted(p for p in assets_dir.iterdir() if p.is_file())
-    if not files:
+    non_sums_files = sorted(
+        p for p in assets_dir.iterdir() if p.is_file() and p.name != "SHA256SUMS"
+    )
+    if not non_sums_files:
         raise SystemExit("ERROR: no release assets found to publish")
 
-    for fpath in files:
+    def upload_or_replace(fpath: Path, digest: str) -> None:
         size = fpath.stat().st_size
         if size <= 0 or size >= MAX_ASSET_BYTES:
             raise SystemExit(f"ERROR: invalid asset size for {fpath.name}: {size} bytes")
-        digest = sha256_file(fpath)
         if fpath.name in existing_assets:
             remote = existing_assets[fpath.name]
             remote_digest = (remote.get("digest") or "").removeprefix("sha256:")
             if remote_digest and remote_digest == digest and remote.get("state") == "uploaded":
                 print(f"[publish] reusing identical uploaded asset: {fpath.name}")
-                continue
-            if is_draft:
+                return
+            if allow_replace:
                 gh_request(
                     "DELETE",
                     f"https://api.github.com/repos/{vault_repo}/releases/assets/{remote['id']}",
                     token=vault_token,
                     allow_404=True,
                 )
+                print(f"[publish] replaced existing asset: {fpath.name}")
             else:
                 raise SystemExit(
                     f"ERROR: published release {release_tag} already has differing asset {fpath.name}"
@@ -578,6 +630,16 @@ def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_s
         if uploaded.get("state") != "uploaded":
             raise SystemExit(f"ERROR: asset {fpath.name} did not reach uploaded state")
         print(f"[publish] uploaded {fpath.name} ({size} bytes)")
+
+    for fpath in non_sums_files:
+        digest = sha256_file(fpath)
+        upload_or_replace(fpath, digest)
+        merged_digests[fpath.name] = digest
+
+    sums_path = assets_dir / "SHA256SUMS"
+    sums_body = "".join(f"{d}  {name}\n" for name, d in sorted(merged_digests.items()))
+    sums_path.write_text(sums_body, encoding="utf-8")
+    upload_or_replace(sums_path, sha256_file(sums_path))
 
     gh_request(
         "PATCH",
