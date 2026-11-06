@@ -486,3 +486,33 @@ jobs:
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Notify flatpak-hub of new Linux release
+        if: env.FLATPAK_HUB_TOKEN != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          FLATPAK_HUB_TOKEN: ${{ secrets.FLATPAK_HUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.check-version.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          DEB_NAME="DSH-NEXT-${VERSION}-amd64.deb"
+          DEB_PATH="artifacts/${DEB_NAME}"
+          DEB_SIZE=$(stat -c '%s' "$DEB_PATH")
+          DEB_SHA256=$(awk -v f="$DEB_NAME" '$2 == f {print $1; exit}' artifacts/SHA256SUMS)
+          DEB_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${DEB_NAME}"
+          PAYLOAD=$(jq -nc \
+            --arg app_id "io.github.anywhere_labs.DshNext" \
+            --arg version "$VERSION" \
+            --arg url "$DEB_URL" \
+            --arg sha256 "$DEB_SHA256" \
+            --argjson size "$DEB_SIZE" \
+            '{event_type: "upstream-release", client_payload: {app_id: $app_id, version: $version, url: $url, sha256: $sha256, size: $size}}')
+          curl -fsSL --retry 2 --retry-delay 3 -X POST \
+            -H "Authorization: Bearer ${FLATPAK_HUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/helloshu/flatpak-hub/dispatches" \
+            -d "$PAYLOAD"
