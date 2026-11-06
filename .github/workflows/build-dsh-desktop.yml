@@ -205,14 +205,12 @@ jobs:
               EXPECTED=(
                 "DSH-NEXT-${VERSION}-amd64.deb"
                 "DSH-NEXT-${VERSION}-x86_64.AppImage"
-                "DSH-NEXT-${VERSION}-linux-x64.tar.gz"
               )
               ;;
             arm64)
               EXPECTED=(
                 "DSH-NEXT-${VERSION}-arm64.deb"
                 "DSH-NEXT-${VERSION}-arm64.AppImage"
-                "DSH-NEXT-${VERSION}-linux-arm64.tar.gz"
               )
               ;;
           esac
@@ -422,10 +420,8 @@ jobs:
           EXPECTED=(
             "DSH-NEXT-${VERSION}-amd64.deb"
             "DSH-NEXT-${VERSION}-x86_64.AppImage"
-            "DSH-NEXT-${VERSION}-linux-x64.tar.gz"
             "DSH-NEXT-${VERSION}-arm64.deb"
             "DSH-NEXT-${VERSION}-arm64.AppImage"
-            "DSH-NEXT-${VERSION}-linux-arm64.tar.gz"
             "DSH-NEXT-${VERSION}-x64-Setup.exe"
             "DSH-NEXT-${VERSION}-x64-Portable.zip"
             "DSH-NEXT-${VERSION}-universal.dmg"
@@ -478,7 +474,7 @@ jobs:
             Automated unsigned build of [anywhere-labs/dsh-desktop ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/anywhere-labs/dsh-desktop/releases/tag/${{ needs.check-version.outputs.upstream_tag }}) (Next channel).
 
             Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
-            Linux (x64 / arm64: AppImage, deb, tar.gz), Windows x64 (NSIS installer + portable zip) and macOS universal (unsigned, not notarized DMG).
+            Linux (x64 / arm64: AppImage, deb), Windows x64 (NSIS installer + portable zip) and macOS universal (unsigned, not notarized DMG).
             The source archive contains tracked files of the upstream repository only; pinned submodules are fetched from their upstream repositories at build time.
             SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
 
