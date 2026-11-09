@@ -220,19 +220,36 @@ jobs:
           sdkmanager "platforms;android-${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" "cmake;3.22.1" \
             || sdkmanager "platforms;android-${COMPILE_SDK}.0" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}" "cmake;3.22.1"
 
-          # Ensure local throwaway debug keystore exists before signing.gradle evaluates
-          mkdir -p "$HOME/.android"
-          if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            keytool -genkeypair \
-              -keystore "$HOME/.android/debug.keystore" \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          # Write local throwaway build keystore to signing.properties (gitignored) so signing.gradle
+          # never depends on runner XDG_CONFIG_HOME vs HOME debug.keystore location; real release
+          # signing happens in the isolated sign-android job.
+          TMP_KS="/tmp/shizuku-build.jks"
+          rm -f "$TMP_KS"
+          keytool -genkeypair \
+            -keystore "$TMP_KS" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          printf 'KEYSTORE_FILE=%s\nKEYSTORE_PASSWORD=android\nKEYSTORE_ALIAS=androiddebugkey\nKEYSTORE_ALIAS_PASSWORD=android\n' "$TMP_KS" > signing.properties
+
+          # Pre-fetch Gradle wrapper distribution with retries to avoid transient services.gradle.org 504s
+          DIST_URL=$(grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | cut -d'=' -f2- | sed 's/\\:/:/g' | tr -d '\r')
+          DIST_FILE=$(basename "$DIST_URL")
+          curl -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+            "$DIST_URL" -o "/tmp/${DIST_FILE}" \
+            || curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+              "https://downloads.gradle.org/distributions/${DIST_FILE}" -o "/tmp/${DIST_FILE}" \
+            || curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+              "https://mirrors.cloud.tencent.com/gradle/${DIST_FILE}" -o "/tmp/${DIST_FILE}"
+          unzip -tq "/tmp/${DIST_FILE}" >/dev/null
+          sed -i \
+            -e "s|^distributionUrl=.*|distributionUrl=file\\\\:///tmp/${DIST_FILE}|" \
+            -e "s|^validateDistributionUrl=.*|validateDistributionUrl=false|" \
+            gradle/wrapper/gradle-wrapper.properties
 
           chmod +x gradlew
           ./gradlew :manager:assembleRelease --no-daemon

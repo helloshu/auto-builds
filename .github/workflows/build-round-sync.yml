@@ -232,6 +232,21 @@ jobs:
             GOOS=android GOARCH=arm64 go get -v -d -tags 'android noselfupdate' "github.com/rclone/rclone@v${RCLONE_VERSION}"
           )
 
+          # Pre-fetch Gradle wrapper distribution with retries to avoid transient services.gradle.org timeouts/504s
+          DIST_URL=$(grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | cut -d'=' -f2- | sed 's/\\:/:/g' | tr -d '\r')
+          DIST_FILE=$(basename "$DIST_URL")
+          curl -fL --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+            "$DIST_URL" -o "/tmp/${DIST_FILE}" \
+            || curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+              "https://downloads.gradle.org/distributions/${DIST_FILE}" -o "/tmp/${DIST_FILE}" \
+            || curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 300 \
+              "https://mirrors.cloud.tencent.com/gradle/${DIST_FILE}" -o "/tmp/${DIST_FILE}"
+          unzip -tq "/tmp/${DIST_FILE}" >/dev/null
+          sed -i \
+            -e "s|^distributionUrl=.*|distributionUrl=file\\\\:///tmp/${DIST_FILE}|" \
+            -e "s|^validateDistributionUrl=.*|validateDistributionUrl=false|" \
+            gradle/wrapper/gradle-wrapper.properties
+
           chmod +x gradlew
           ./gradlew assembleOssRelease --no-daemon
 
