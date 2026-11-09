@@ -191,7 +191,10 @@ jobs:
             ldc \
             libcurl4-openssl-dev \
             libdbus-1-dev \
+            libegl1 \
+            libfontconfig1 \
             libfuse2 \
+            libgl1 \
             libglib2.0-0 \
             libphobos2-ldc-shared-dev \
             libsqlite3-dev \
@@ -200,6 +203,7 @@ jobs:
             libxcb-image0 \
             libxcb-keysyms1 \
             libxcb-render-util0 \
+            libxkbcommon0 \
             libxkbcommon-x11-0 \
             make \
             patchelf \
@@ -478,7 +482,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.release_tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ github.ref_name }}
           name: OneDriveGUI ${{ needs.check-version.outputs.upstream_tag }}
           draft: false
           prerelease: false
