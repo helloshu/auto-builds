@@ -185,6 +185,7 @@ jobs:
             fakeroot \
             file \
             fuse \
+            gcc \
             gnupg \
             gtk-update-icon-cache \
             ldc \
