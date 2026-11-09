@@ -1,0 +1,370 @@
+name: Orion Store Auto Build
+
+on:
+  schedule:
+    - cron: '39 20 * * *' # 每天北京时间 04:39，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: '强制编译指定的 Tag 版本 (例如: 2.7.5)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-orion-store
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-24.04
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
+    steps:
+      - name: Compare version with upstream
+        id: compare
+        shell: bash
+        env:
+          APP_ID: orion-store
+          FORCE_TAG: ${{ inputs.force_tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: RookieEnough/Orion-Store
+        run: |
+          set -euo pipefail
+
+          TAG_RE='^v?[0-9]+\.[0-9]+(\.[0-9]+)?$'
+
+          if [ -n "$FORCE_TAG" ]; then
+            UPSTREAM_TAG="$FORCE_TAG"
+          else
+            # Strip optional leading 'v' before sort -V so 2.7.5 sorts newer than legacy v2.0.5
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50" \
+              --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name' \
+              | grep -E "$TAG_RE" \
+              | awk '{raw=$0; norm=$0; sub(/^v/, "", norm); print norm "\t" raw}' \
+              | sort -V -k1,1 \
+              | tail -n 1 \
+              | cut -f2 || true)
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_TAG" =~ $TAG_RE ]]; then
+            echo "::error::上游标签 ${UPSTREAM_TAG} 不符合版本格式"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为固定提交 SHA"
+            exit 1
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FORCE_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  validate-android-signing:
+    name: Validate Android release signing secrets
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a persistent Android signing identity
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::缺少必需的 Android 签名 Secret: $name"
+              exit 1
+            fi
+          done
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: RookieEnough/Orion-Store
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="Orion-Store-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-orion-store
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build-android:
+    name: Build Android Release APK
+    needs: [check-version, validate-android-signing]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: RookieEnough/Orion-Store
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Setup Java 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: platform-tools
+
+      - name: Build release APK
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' || sdkmanager 'platforms;android-37' 'build-tools;37.0.0' || true
+
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+
+          APK=$(find app/build/outputs/apk/release -maxdepth 2 -type f -name '*.apk' | head -n 1)
+          if [ -z "$APK" ] || [ ! -s "$APK" ]; then
+            echo "::error::未找到编译产物 APK"
+            exit 1
+          fi
+          mkdir -p android-build-input
+          cp "$APK" "android-build-input/Orion-Store-${VERSION}-input.apk"
+
+      - name: Upload Android signing input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-build-input-orion-store
+          path: app-src/android-build-input/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-android:
+    name: Sign Android APK in isolated job
+    needs: [check-version, build-android]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android build tools
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: platform-tools
+
+      - name: Download Android signing input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-build-input-orion-store
+          path: android-input
+
+      - name: Re-sign and verify release APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends zip
+
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          if [ -z "$BUILD_TOOLS" ]; then
+            sdkmanager 'build-tools;37.0.0'
+            BUILD_TOOLS="$ANDROID_HOME/build-tools/37.0.0"
+          fi
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+
+          SIGNING_DIR=$(mktemp -d)
+          trap 'rm -rf "$SIGNING_DIR"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$SIGNING_DIR/release.jks"
+
+          INPUT="android-input/Orion-Store-${VERSION}-input.apk"
+          test -s "$INPUT"
+          cp "$INPUT" "$SIGNING_DIR/unsigned.apk"
+          zip -d "$SIGNING_DIR/unsigned.apk" \
+            'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' >/dev/null 2>&1 || true
+          "$ZIPALIGN" -f -p 4 "$SIGNING_DIR/unsigned.apk" "$SIGNING_DIR/aligned.apk"
+
+          mkdir -p release-assets
+          OUTPUT="release-assets/Orion-Store-${VERSION}-android.apk"
+          "$APKSIGNER" sign \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --ks "$SIGNING_DIR/release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$OUTPUT" \
+            "$SIGNING_DIR/aligned.apk"
+          "$APKSIGNER" verify --verbose --print-certs "$OUTPUT"
+          test -s "$OUTPUT"
+
+      - name: Upload signed Android artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-orion-store-android
+          path: release-assets/*.apk
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, archive-source, sign-android]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "Orion-Store-${VERSION}-android.apk"
+            "Orion-Store-${VERSION}-source.tar.gz"
+          )
+
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Orion Store ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated build of [RookieEnough/Orion-Store ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/RookieEnough/Orion-Store/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            Signed with this repository's persistent Android release certificate; SHA-256 checksums are included in `SHA256SUMS` and GitHub build provenance is attached.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
