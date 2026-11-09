@@ -247,6 +247,10 @@ jobs:
             -e "s|^validateDistributionUrl=.*|validateDistributionUrl=false|" \
             gradle/wrapper/gradle-wrapper.properties
 
+          # Detach hardcoded missing fdroid keystore reference in build-android so :app:packageOssRelease
+          # emits unsigned APKs cleanly; real signing happens in the isolated sign-android job.
+          sed -i '/signingConfig signingConfigs\.release/d' app/build.gradle
+
           chmod +x gradlew
           ./gradlew assembleOssRelease --no-daemon
 
