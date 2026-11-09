@@ -176,6 +176,7 @@ jobs:
 
           apt-get update -o Acquire::Retries=3
           apt-get install -y --no-install-recommends \
+            binutils \
             ca-certificates \
             curl \
             desktop-file-utils \
@@ -237,6 +238,7 @@ jobs:
           # 3. Compile abraunegg/onedrive v2.5.12 (meets OneDriveGUI MIN_CLIENT_VERSION >= 2.5.11)
           rm -rf /tmp/od-build
           cp -a /onedrive-cli-src /tmp/od-build
+          rm -rf /tmp/od-build/.git
           cd /tmp/od-build
           echo "v2.5.12" > version
           ./configure \
@@ -259,6 +261,17 @@ jobs:
                 ;;
             esac
           done
+          # Drop Debian-specific @CURL_OPENSSL_4 symbol version tags so onedrive loads cleanly
+          # on both Debian/Ubuntu and Flatpak org.freedesktop.Platform's libcurl.so.4
+          if patchelf --help 2>&1 | grep -q -- '--clear-symbol-version'; then
+            CLEAR_ARGS=()
+            while IFS= read -r sym; do
+              [ -n "$sym" ] && CLEAR_ARGS+=(--clear-symbol-version "$sym")
+            done < <(nm -D -u "$CLI_DIR/onedrive" 2>/dev/null | awk '/@CURL_OPENSSL_4$/ {sub(/@.*/, "", $NF); print $NF}' | sort -u)
+            if [ "${#CLEAR_ARGS[@]}" -gt 0 ]; then
+              patchelf "${CLEAR_ARGS[@]}" "$CLI_DIR/onedrive"
+            fi
+          fi
           patchelf --set-rpath '$ORIGIN/lib' "$CLI_DIR/onedrive"
           "$CLI_DIR/onedrive" --version | grep -Fq "onedrive v2.5.12"
 

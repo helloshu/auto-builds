@@ -234,6 +234,59 @@ jobs:
               runtime/build-runtime.sh
             sed -i 's|https://registry.npmmirror.com|https://registry.npmjs.org|g' runtime/locks/*/package-lock.json
           fi
+
+          # Termux apt repo only retains the latest version of each rolling package;
+          # sync PROOT/TALLOC/SHMEM version & SHA-256 pins from the live Termux index when bumped.
+          python3 - <<'PYSYNC'
+          from pathlib import Path
+          import hashlib, re, urllib.request
+
+          script_path = Path("runtime/build-runtime.sh")
+          txt = script_path.read_text(encoding="utf-8")
+          pkgs = {"aarch64": {}, "x86_64": {}}
+          for arch in ("aarch64", "x86_64"):
+              url = f"https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-{arch}/Packages"
+              raw = urllib.request.urlopen(url, timeout=30).read().decode("utf-8", errors="replace")
+              for block in raw.split("\n\n"):
+                  kv = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+                  if kv.get("Package") in ("proot", "libtalloc", "libandroid-shmem"):
+                      pkgs[arch][kv["Package"]] = (kv["Version"], kv["SHA256"])
+
+          new_pins = []
+          for var, pkg in [("PROOT_VERSION", "proot"), ("TALLOC_VERSION", "libtalloc"), ("SHMEM_VERSION", "libandroid-shmem")]:
+              ver_a64, sha_a64 = pkgs["aarch64"][pkg]
+              ver_x64, sha_x64 = pkgs["x86_64"][pkg]
+              if ver_a64 != ver_x64:
+                  continue
+              m = re.search(rf'^{var}="([^"]+)"', txt, re.M)
+              if m and m.group(1) != ver_a64:
+                  print(f"[termux-sync] {pkg}: {m.group(1)} -> {ver_a64}")
+                  txt = re.sub(rf'^{var}="[^"]+"', f'{var}="{ver_a64}"', txt, count=1, flags=re.M)
+                  new_pins.append(f"  [{pkg}_{ver_a64}_aarch64.deb]={sha_a64}")
+                  new_pins.append(f"  [{pkg}_{ver_a64}_x86_64.deb]={sha_x64}")
+                  if pkg == "proot":
+                      src_url = f"https://github.com/termux/proot/archive/v{ver_a64}.zip"
+                      try:
+                          data = urllib.request.urlopen(src_url, timeout=30).read()
+                          src_sha = hashlib.sha256(data).hexdigest()
+                          new_pins.append(f"  [proot-v{ver_a64}.zip]={src_sha}")
+                      except Exception:
+                          txt = txt.replace(
+                              'proot_src="$CACHE/termux/proot-v$PROOT_VERSION.zip"',
+                              f'proot_src="$CACHE/termux/proot-v{m.group(1)}.zip"',
+                          ).replace(
+                              'https://github.com/termux/proot/archive/v$PROOT_VERSION.zip',
+                              f'https://github.com/termux/proot/archive/v{m.group(1)}.zip',
+                          ).replace(
+                              'pin_of "proot-v$PROOT_VERSION.zip"',
+                              f'pin_of "proot-v{m.group(1)}.zip"',
+                          )
+
+          if new_pins:
+              txt = txt.replace("declare -A PIN=(\n", "declare -A PIN=(\n" + "\n".join(new_pins) + "\n", 1)
+              script_path.write_text(txt, encoding="utf-8")
+          PYSYNC
+
           bash runtime/build-runtime.sh arm64-v8a x86_64 \
             || UPDATE_DEB_LOCK=1 bash runtime/build-runtime.sh arm64-v8a x86_64
 
@@ -376,10 +429,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Download all artifacts
+      - name: Download signed Android artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: source-*
           merge-multiple: true
 
       - name: Verify complete artifact manifest

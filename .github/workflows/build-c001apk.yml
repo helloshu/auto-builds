@@ -434,12 +434,13 @@ jobs:
           test ! -f build/ios/iphoneos/Runner.app/embedded.mobileprovision
 
           version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | tr -d '\r')
-          mkdir -p ../../release-assets build/ios-staging/Payload
+          OUT_DIR="$(cd ../.. && pwd)/release-assets"
+          mkdir -p "$OUT_DIR" build/ios-staging/Payload
           ditto build/ios/iphoneos/Runner.app build/ios-staging/Payload/Runner.app
           archive="c001apk-${version}-ios-arm64-unsigned.ipa"
-          (cd build/ios-staging && ditto -c -k --keepParent Payload "../../../release-assets/${archive}")
-          unzip -t "../../release-assets/${archive}"
-          test -s "../../release-assets/${archive}"
+          (cd build/ios-staging && ditto -c -k --keepParent Payload "${OUT_DIR}/${archive}")
+          unzip -t "${OUT_DIR}/${archive}"
+          test -s "${OUT_DIR}/${archive}"
 
       - name: Upload unsigned iOS artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -459,10 +460,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Download all artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: source-*
           merge-multiple: true
 
       - name: Verify complete artifact manifest

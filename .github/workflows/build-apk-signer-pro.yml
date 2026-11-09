@@ -299,10 +299,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Download all artifacts
+      - name: Download signed Android artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: source-*
           merge-multiple: true
 
       - name: Verify complete artifact manifest
