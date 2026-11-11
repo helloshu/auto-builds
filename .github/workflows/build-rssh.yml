@@ -209,7 +209,7 @@ jobs:
             target: aarch64-apple-darwin
             os_name: macos
             arch: aarch64
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             os_name: macos
             arch: x86_64
@@ -446,10 +446,20 @@ jobs:
           chmod +x idea-plugin/gradlew
           (
             cd idea-plugin
-            ./gradlew --no-daemon clean buildPlugin \
-              -PrsshIdeVersion=2024.2 \
-              -PrsshServerBin="$SERVER" \
-              -PpluginVersion="$VERSION"
+            for attempt in 1 2 3; do
+              if ./gradlew --no-daemon clean buildPlugin \
+                -PrsshIdeVersion=2024.2 \
+                -PrsshServerBin="$SERVER" \
+                -PpluginVersion="$VERSION"; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::JetBrains 插件编译在连续 3 次尝试后失败"
+                exit 1
+              fi
+              echo "::warning::JetBrains 插件编译第 ${attempt} 次失败（可能遇到依赖下载 502/503），等待后重试..."
+              sleep $((attempt * 10))
+            done
           )
 
           PLUGINS=()
