@@ -5,7 +5,7 @@
 # Subcommands:
 #   vault-api.sh prepare <target-id>
 #   vault-api.sh report-issue <target-id> <summary> <log-file>
-#   vault-api.sh publish-release <resolved-env> <notes-file> <assets-dir>
+#   vault-api.sh publish-release [--keep-draft] <resolved-env> <notes-file> <assets-dir>
 
 set -euo pipefail
 
@@ -529,7 +529,9 @@ def download_asset_text(vault_repo: str, vault_token: str, asset_id: int) -> str
         raise
 
 
-def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_str: str) -> None:
+def cmd_publish_release(
+    resolved_env_str: str, notes_file_str: str, assets_dir_str: str, keep_draft: bool = False
+) -> None:
     vault_repo = os.environ["VAULT_REPO"].strip()
     vault_token = os.environ["VAULT_TOKEN"].strip()
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
@@ -641,6 +643,7 @@ def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_s
     sums_path.write_text(sums_body, encoding="utf-8")
     upload_or_replace(sums_path, sha256_file(sums_path))
 
+    target_draft = is_draft if keep_draft else False
     gh_request(
         "PATCH",
         f"https://api.github.com/repos/{vault_repo}/releases/{rel_id}",
@@ -648,10 +651,13 @@ def cmd_publish_release(resolved_env_str: str, notes_file_str: str, assets_dir_s
         data={
             "name": f"{cfg['DISPLAY_NAME']} {cfg['UPSTREAM_TAG']}",
             "body": notes_body + provenance_footer,
-            "draft": False,
+            "draft": target_draft,
         },
     )
-    print(f"[publish] finalized private release {release_tag}")
+    if target_draft:
+        print(f"[publish] staged partial assets into draft release {release_tag}")
+    else:
+        print(f"[publish] finalized private release {release_tag}")
 
 
 def main() -> None:
@@ -663,7 +669,13 @@ def main() -> None:
     elif sub == "report-issue":
         cmd_report_issue(sys.argv[2], sys.argv[3], sys.argv[4])
     elif sub == "publish-release":
-        cmd_publish_release(sys.argv[2], sys.argv[3], sys.argv[4])
+        keep_draft_flag = "--keep-draft" in sys.argv[2:]
+        pos_args = [a for a in sys.argv[2:] if a != "--keep-draft"]
+        if len(pos_args) != 3:
+            raise SystemExit(
+                "usage: vault-api.sh publish-release [--keep-draft] <resolved-env> <notes-file> <assets-dir>"
+            )
+        cmd_publish_release(pos_args[0], pos_args[1], pos_args[2], keep_draft=keep_draft_flag)
     else:
         raise SystemExit(f"ERROR: unknown subcommand {sub}")
 

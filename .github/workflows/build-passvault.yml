@@ -123,7 +123,7 @@ jobs:
             os: windows-latest
             tasks: ':desktopApp:packageReleaseMsi'
           - id: macos
-            os: macos-15
+            os: macos-latest
             tasks: ':desktopApp:packageReleaseDmg'
     steps:
       - name: Check platform selection
@@ -214,6 +214,8 @@ jobs:
       - name: Install protobuf compiler
         if: steps.gate.outputs.run == 'true'
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           case "${RUNNER_OS}" in
             Linux)   sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
@@ -301,7 +303,7 @@ jobs:
   build-ios:
     needs: prepare
     if: needs.prepare.outputs.should_skip != 'true' && inputs.include_ios == true
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 300
     permissions:
       contents: read
@@ -332,6 +334,8 @@ jobs:
 
       - name: Install Rust and XcodeGen tools
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           for target_arch in aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin; do
@@ -365,22 +369,17 @@ jobs:
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
-      needs.prepare.outputs.should_skip != 'true' &&
-      needs.build.result == 'success' &&
-      (needs.build-ios.result == 'success' || needs.build-ios.result == 'skipped')
+      needs.prepare.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      ALL_BUILDS_OK: ${{ needs.build.result == 'success' && (needs.build-ios.result == 'success' || needs.build-ios.result == 'skipped') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: temurin
-          java-version: '21'
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -388,7 +387,28 @@ jobs:
           path: ${{ runner.temp }}/enc-in
           merge-multiple: true
 
+      - name: Check built package artifacts
+        id: check_pkgs
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pkgs=("$RUNNER_TEMP/enc-in"/pkg-*.enc)
+          echo "count=${#pkgs[@]}" >> "$GITHUB_OUTPUT"
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "[sign-and-publish] No platform package artifacts were produced."
+            if [ "${ALL_BUILDS_OK}" != "true" ]; then
+              exit 1
+            fi
+          fi
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        if: steps.check_pkgs.outputs.count != '0'
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - name: Decrypt, verify, sign APK, and assemble release assets
+        if: steps.check_pkgs.outputs.count != '0'
         shell: bash
         env:
           TRANSIT_SECRET: ${{ secrets.TRANSIT_SECRET }}
@@ -409,13 +429,15 @@ jobs:
             bash .github/scripts/transit-crypto.sh decrypt "$pkg_enc" "$RUNNER_TEMP/raw-pkgs"
           done
 
-          if [ ! -d "${ANDROID_HOME}/build-tools" ]; then
-            bash .github/scripts/install-android-sdk.sh "build-tools;${BUILD_TOOLS}"
-          fi
-
+          unsigned_apks=("$RUNNER_TEMP/raw-pkgs"/*-unsigned.apk)
           ks_file="$RUNNER_TEMP/release.keystore"
-          printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
-          trap 'rm -f "$ks_file"' EXIT
+          if [ "${#unsigned_apks[@]}" -gt 0 ]; then
+            if [ ! -d "${ANDROID_HOME}/build-tools" ]; then
+              bash .github/scripts/install-android-sdk.sh "build-tools;${BUILD_TOOLS}"
+            fi
+            printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
+            trap 'rm -f "$ks_file"' EXIT
+          fi
 
           for item in "$RUNNER_TEMP/raw-pkgs"/*; do
             base="$(basename "$item")"
@@ -442,16 +464,29 @@ jobs:
           ( cd "$RUNNER_TEMP/release-assets" && sha256sum -- * > SHA256SUMS )
 
       - name: Publish to private vault release
-        if: github.event_name == 'schedule' || inputs.publish_release == true
+        if: steps.check_pkgs.outputs.count != '0' && (github.event_name == 'schedule' || inputs.publish_release == true)
         shell: bash
         env:
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: |
+          extra_args=()
+          if [ "${ALL_BUILDS_OK}" != "true" ]; then
+            echo "::warning::Build matrix incomplete; staging completed platform packages into Draft release."
+            extra_args+=(--keep-draft)
+          fi
           bash .github/scripts/vault-api.sh publish-release \
             "$RUNNER_TEMP/kit/resolved.env" \
             "$RUNNER_TEMP/kit/target/notes.md" \
-            "$RUNNER_TEMP/release-assets"
+            "$RUNNER_TEMP/release-assets" \
+            "${extra_args[@]}"
+
+      - name: Enforce full build matrix completion
+        if: env.ALL_BUILDS_OK != 'true'
+        shell: bash
+        run: |
+          echo "::error::One or more upstream build jobs did not succeed; completed packages (if any) were preserved as Draft."
+          exit 1
 
   cleanup-transit:
     needs: [prepare, build, build-ios, sign-and-publish]
