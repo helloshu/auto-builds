@@ -299,14 +299,95 @@ jobs:
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
 
-          GRADLE_EXT=$(grep -rlE 'ndkVersion' "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main" | head -n 1)
-          NDK_VERSION=$(grep -oE 'ndkVersion[^"]*"[0-9.]+"' "$GRADLE_EXT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-          COMPILE_SDK=$(grep -oE 'compileSdkVersion[^0-9]*[0-9]+' "$GRADLE_EXT" | grep -oE '[0-9]+$' | head -n 1)
-          echo "Resolved Flutter Android defaults: compileSdk=${COMPILE_SDK:-36}, ndk=${NDK_VERSION}"
+          ANDROID_ENV_FILE="${RUNNER_TEMP:-/tmp}/dsh-android-env.sh"
+          python3 - <<'PYANDROID' > "$ANDROID_ENV_FILE"
+          import hashlib, json, os, re, shlex, time, urllib.request
+          from pathlib import Path
+
+          flutter_root = Path(os.environ["FLUTTER_ROOT"])
+          gradle_src = flutter_root / "packages/flutter_tools/gradle/src/main"
+          preferred = [
+              gradle_src / "kotlin/FlutterExtension.kt",
+              gradle_src / "groovy/FlutterExtension.groovy",
+          ]
+          candidates = [p for p in preferred if p.is_file()]
+          if gradle_src.is_dir():
+              for p in sorted(gradle_src.rglob("*")):
+                  if p.is_file() and p not in candidates and p.suffix in {".kt", ".groovy", ".java"}:
+                      candidates.append(p)
+
+          ndk_version = ""
+          compile_sdk = ""
+          for path in candidates:
+              text = path.read_text(encoding="utf-8", errors="replace")
+              if not ndk_version:
+                  m = re.search(r'\bndkVersion\b[^\n=]*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+                  if m:
+                      ndk_version = m.group(1)
+              if not compile_sdk:
+                  m = re.search(r'\bcompileSdkVersion\b[^\n=]*=\s*([0-9]+)\b', text)
+                  if m:
+                      compile_sdk = m.group(1)
+              if ndk_version and compile_sdk:
+                  break
+
+          ndk_version = ndk_version or "28.2.13676358"
+          compile_sdk = compile_sdk or "36"
+
+          tawc_ndk_version = ""
+          tawc_source_path = Path("runtime/tawcroot/source.json")
+          if tawc_source_path.is_file():
+              tawc_src = json.loads(tawc_source_path.read_text(encoding="utf-8"))
+              tawc_ndk_version = str(tawc_src.get("ndkVersion") or "").strip()
+              commit = tawc_src.get("commit")
+              archive_url = tawc_src.get("archiveUrl")
+              archive_sha = tawc_src.get("archiveSha256")
+              if commit and archive_url and archive_sha:
+                  cache_dir = Path("runtime/.cache/tawcroot")
+                  cache_dir.mkdir(parents=True, exist_ok=True)
+                  target = cache_dir / f"{commit}.zip"
+                  need_fetch = True
+                  if target.is_file():
+                      if hashlib.sha256(target.read_bytes()).hexdigest() == archive_sha:
+                          need_fetch = False
+                  if need_fetch:
+                      for attempt in range(1, 5):
+                          try:
+                              data = urllib.request.urlopen(archive_url, timeout=60).read()
+                              if hashlib.sha256(data).hexdigest() != archive_sha:
+                                  raise ValueError("tawc archive SHA-256 mismatch")
+                              tmp = cache_dir / f"{commit}.zip.part"
+                              tmp.write_bytes(data)
+                              os.replace(tmp, target)
+                              break
+                          except Exception:
+                              if attempt == 4:
+                                  raise
+                              time.sleep(attempt * 3)
+
+          print(f"NDK_VERSION={shlex.quote(ndk_version)}")
+          print(f"COMPILE_SDK={shlex.quote(compile_sdk)}")
+          print(f"TAWC_NDK_VERSION={shlex.quote(tawc_ndk_version)}")
+          PYANDROID
+          source "$ANDROID_ENV_FILE"
+          echo "Resolved Flutter Android defaults: compileSdk=${COMPILE_SDK}, ndk=${NDK_VERSION}, tawcNdk=${TAWC_NDK_VERSION:-<none>}"
+
+          # Clear runner-prepopulated NDK environment variables (e.g. NDK 27.x in /etc/environment)
+          # so runtime/tawcroot/build.py and AGP strictly resolve pinned NDK versions under $ANDROID_HOME/ndk/.
+          unset ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_LATEST_HOME ANDROID_NDK_ROOT || true
+
+          NDK_PKGS=("ndk;${NDK_VERSION}")
+          if [ -n "$TAWC_NDK_VERSION" ] && [ "$TAWC_NDK_VERSION" != "$NDK_VERSION" ]; then
+            NDK_PKGS+=("ndk;${TAWC_NDK_VERSION}")
+          fi
 
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-${COMPILE_SDK:-36}" "build-tools;${COMPILE_SDK:-36}.0.0" "ndk;${NDK_VERSION}" "cmake;3.22.1" \
-            || sdkmanager "platforms;android-${COMPILE_SDK:-36}.0" "build-tools;${COMPILE_SDK:-36}.0.0" "ndk;${NDK_VERSION}" "cmake;3.22.1"
+          sdkmanager "platforms;android-${COMPILE_SDK}" "build-tools;${COMPILE_SDK}.0.0" "${NDK_PKGS[@]}" "cmake;3.22.1" \
+            || sdkmanager "platforms;android-${COMPILE_SDK}.0" "build-tools;${COMPILE_SDK}.0.0" "${NDK_PKGS[@]}" "cmake;3.22.1"
+
+          if [ -n "$TAWC_NDK_VERSION" ]; then
+            test -f "$ANDROID_HOME/ndk/${TAWC_NDK_VERSION}/source.properties"
+          fi
 
           flutter config --no-analytics --android-sdk "$ANDROID_HOME" --jdk-dir "$JAVA_HOME"
           (
@@ -322,7 +403,17 @@ jobs:
             chmod +x gradlew
           )
 
-          DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh -f all --build-name "$VERSION" --keep-daemon
+          for attempt in 1 2 3; do
+            if DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh -f all --build-name "$VERSION" --keep-daemon; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::APK 构建在连续 3 次尝试后仍失败"
+              exit 1
+            fi
+            echo "::warning::tooling/build-apk.sh 第 ${attempt} 次尝试失败，10 秒后重试以规避外部仓库偶发网络波动..."
+            sleep 10
+          done
 
           mkdir -p android-build-input
           for flavor in arm64 x64; do
