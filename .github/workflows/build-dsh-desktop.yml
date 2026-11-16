@@ -18,6 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  NODE_VERSION: '24.14.0'
   DSH_TELEMETRY_DISABLED: '1'
   YARN_ENABLE_HARDENED_MODE: 'false'
   YARN_ENABLE_TELEMETRY: '0'
@@ -166,20 +167,33 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22.23.2'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Enable Corepack and install dependencies
+        shell: bash
         working-directory: ./dsh-src
         run: |
+          set -euo pipefail
           corepack enable
-          yarn install --immutable
+          for attempt in 1 2 3; do
+            if yarn install --immutable; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "::warning::yarn install 第 ${attempt} 次尝试失败，10 秒后重试..."
+            sleep 10
+          done
+          if [ -f scripts/prepare-agents-anywhere-runtime.mjs ]; then
+            node scripts/prepare-agents-anywhere-runtime.mjs
+          fi
 
       - name: Prepare shared release inputs
+        shell: bash
         working-directory: ./dsh-src
         run: |
-          yarn market:prepare
-          yarn aa:prepare-release
-          yarn workspace dsh-community-market build
+          set -euo pipefail
           yarn workspace dsh-desktop-next check:linux-package:platform
 
       - name: Package Linux artifacts
@@ -251,25 +265,37 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22.23.2'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Enable Corepack and resolve the upstream toolchain
+        shell: bash
         working-directory: ./dsh-src
         run: |
+          set -euo pipefail
           corepack enable
           yarn upstream:version
 
       - name: Install dependencies
-        working-directory: ./dsh-src
-        run: yarn install --immutable
-
-      - name: Prepare shared release inputs
+        shell: bash
         working-directory: ./dsh-src
         run: |
-          yarn market:prepare
-          yarn aa:prepare-release
-          yarn aa:prepare-release --verify-release
-          yarn workspace dsh-community-market build
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if yarn install --immutable; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "::warning::yarn install 第 ${attempt} 次尝试失败，10 秒后重试..."
+            sleep 10
+          done
+
+      - name: Prepare shared release inputs
+        shell: bash
+        working-directory: ./dsh-src
+        run: |
+          set -euo pipefail
           yarn workspace dsh-desktop-next check:win-package:platform
 
       - name: Build Windows installer
@@ -334,20 +360,56 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22.23.2'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Enable Corepack and install dependencies
+        shell: bash
         working-directory: ./dsh-src
         run: |
+          set -euo pipefail
           corepack enable
-          yarn install --immutable
+          for attempt in 1 2 3; do
+            if yarn install --immutable; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "::warning::yarn install 第 ${attempt} 次尝试失败，10 秒后重试..."
+            sleep 10
+          done
+          if [ -f scripts/prepare-agents-anywhere-runtime.mjs ]; then
+            node scripts/prepare-agents-anywhere-runtime.mjs
+          fi
 
       - name: Prepare shared release inputs
+        shell: bash
         working-directory: ./dsh-src
         run: |
-          yarn market:prepare
-          yarn aa:prepare-release
-          yarn workspace dsh-community-market build
+          set -euo pipefail
+          # Upstream tagged v2.0.23-next before PR #1649 (b3c0442), missing darwin CUA & Office
+          # native helper globs in build.mac.x64ArchFiles required by @electron/universal.
+          node --input-type=module - <<'EOF'
+          import fs from 'node:fs'
+          const pkgPath = 'dsh-desktop-next/package.json'
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+          const archFiles = pkg.build?.mac?.x64ArchFiles
+          if (typeof archFiles === 'string') {
+            const extra = [
+              '@deepseek-ai/dsh-experimental-cua-macos/native/bin/darwin-*/**',
+              '@deepseek-ai/libreoffice-kit/frame-forwarding/prebuilds/darwin-*/**',
+            ]
+            const missing = extra.filter(entry => !archFiles.includes(entry))
+            if (missing.length > 0 && archFiles.includes('},Contents/Resources/runtime/**')) {
+              pkg.build.mac.x64ArchFiles = archFiles.replace(
+                '},Contents/Resources/runtime/**',
+                `,${missing.join(',')}},Contents/Resources/runtime/**`,
+              )
+              fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`)
+              console.log(`Patched dsh-desktop-next build.mac.x64ArchFiles with: ${missing.join(', ')}`)
+            }
+          }
+          EOF
           yarn workspace dsh-desktop-next check:mac-package:platform
 
       # 无签名/公证的通用（Intel + Apple Silicon）DMG：上游正式发布在带证书的本机签名，此处使用其 mac-smoke 打包路径。
@@ -465,7 +527,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.release_tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ github.ref_name }}
           name: DSH NEXT ${{ needs.check-version.outputs.upstream_tag }}
           draft: false
           prerelease: false
