@@ -1,0 +1,693 @@
+name: ShellRS Auto Build & Release
+
+on:
+  schedule:
+    - cron: '11 22 * * *' # 每天北京时间 06:11，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '强制编译指定的上游 Tag 版本 (例: v0.1.19)'
+        required: false
+        default: ''
+      expected_sha:
+        description: '可选：强制校验上游 40 位 Commit SHA'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-shell-rs
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-24.04
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      app_id: ${{ steps.compare.outputs.app_id }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
+    steps:
+      - name: 获取上游最新正式 Tag 并检查本地 Release
+        id: compare
+        shell: bash
+        env:
+          APP_ID: shell-rs
+          UPSTREAM_REPO: since2006/shell-rs
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_RE='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+
+          if [ -n "$INPUT_TAG" ]; then
+            UPSTREAM_TAG="$INPUT_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50" \
+              --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name' \
+              | grep -E "$TAG_RE" \
+              | awk '{raw=$0; norm=$0; sub(/^v/, "", norm); print norm "\t" raw}' \
+              | sort -V -k1,1 \
+              | tail -n 1 \
+              | cut -f2 || true)
+            if [ -z "$UPSTREAM_TAG" ]; then
+              UPSTREAM_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+                | grep -E "$TAG_RE" \
+                | awk '{raw=$0; norm=$0; sub(/^v/, "", norm); print norm "\t" raw}' \
+                | sort -V -k1,1 \
+                | tail -n 1 \
+                | cut -f2 || true)
+            fi
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_TAG" =~ $TAG_RE ]]; then
+            echo "::error::上游标签 ${UPSTREAM_TAG} 不符合正式版格式 (vX.Y.Z)"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为 40 位固定提交 SHA"
+            exit 1
+          fi
+
+          if [ -n "$EXPECTED_SHA" ]; then
+            if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::expected_sha 必须是 40 位小写十六进制 Commit SHA"
+              exit 1
+            fi
+            if [ "$UPSTREAM_SHA" != "$EXPECTED_SHA" ]; then
+              echo "::error::上游 ${UPSTREAM_TAG} 提交 SHA 不匹配: 预期 ${EXPECTED_SHA}，实际 ${UPSTREAM_SHA}"
+              exit 1
+            fi
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "app_id=$APP_ID"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$INPUT_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: since2006/shell-rs
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="shell-rs-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-shell-rs
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build-linux:
+    name: Build Linux x86_64 (tar.gz, deb, rpm, AppImage)
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: since2006/shell-rs
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shell-rs/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shell-rs 安全补丁 (patches/shell-rs/*.patch)"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Install Linux build and packaging dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang pkg-config file dpkg-dev rpm \
+            libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libdbus-1-dev libssl-dev
+
+      - name: Install pinned Rust toolchain from upstream rust-toolchain.toml
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Build hardened shellrs binary (no telemetry/updater channel)
+        working-directory: ./app-src
+        shell: bash
+        env:
+          SHELLRS_COMMIT: ${{ needs.check-version.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          export SHELLRS_BUILD_DATE=$(date -u +%Y-%m-%d)
+          unset SHELLRS_UPDATE_CHANNEL
+          cargo build --release --locked --bin shellrs
+          test -x target/release/shellrs
+          git diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Package Linux tar.gz, deb, rpm, and SHA-256-verified AppImage
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          BIN="$PWD/target/release/shellrs"
+          OUT="$PWD/../release-assets"
+          WORK="$RUNNER_TEMP/shellrs-linux-pkg"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK" "$OUT"
+
+          # 1. Portable tar.gz
+          TAR_NAME="ShellRS-${VERSION}-linux-x86_64"
+          mkdir -p "$WORK/$TAR_NAME"
+          install -Dm755 "$BIN" "$WORK/$TAR_NAME/shellrs"
+          strip "$WORK/$TAR_NAME/shellrs"
+          install -Dm644 packaging/linux/shellrs.desktop "$WORK/$TAR_NAME/shellrs.desktop"
+          install -Dm644 assets/logo/shellrs.png "$WORK/$TAR_NAME/shellrs.png"
+          install -Dm644 LICENSE "$WORK/$TAR_NAME/LICENSE"
+          tar -C "$WORK" --owner=0 --group=0 -czf "$OUT/ShellRS-${VERSION}-linux-x86_64.tar.gz" "$TAR_NAME"
+
+          # 2. Debian .deb
+          DEB_DIR="$WORK/deb"
+          install -Dm755 "$WORK/$TAR_NAME/shellrs" "$DEB_DIR/usr/bin/shellrs"
+          install -Dm644 packaging/linux/shellrs.desktop "$DEB_DIR/usr/share/applications/shellrs.desktop"
+          install -Dm644 assets/logo/shellrs.png "$DEB_DIR/usr/share/icons/hicolor/512x512/apps/shellrs.png"
+          install -Dm644 LICENSE "$DEB_DIR/usr/share/doc/shellrs/copyright"
+          mkdir -p "$WORK/shlibs/debian"
+          printf 'Source: shellrs\n\nPackage: shellrs\nArchitecture: any\n' > "$WORK/shlibs/debian/control"
+          DEPENDS=$(cd "$WORK/shlibs" && dpkg-shlibdeps -O "$DEB_DIR/usr/bin/shellrs" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
+          mkdir -p "$DEB_DIR/DEBIAN"
+          cat > "$DEB_DIR/DEBIAN/control" <<EOF
+          Package: shellrs
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: auto-builds <noreply@github.com>
+          Installed-Size: $(du -sk --exclude=DEBIAN "$DEB_DIR" | cut -f1)
+          Depends: ${DEPENDS}
+          Recommends: libwayland-client0, libxcb1, libx11-xcb1, libvulkan1, mesa-vulkan-drivers
+          Section: net
+          Priority: optional
+          Homepage: https://github.com/since2006/shell-rs
+          Description: Native GPU-accelerated SSH host manager (hardened build)
+           Terminal, SFTP, port forwarding, and end-to-end encrypted sync built
+           with Rust and GPUI. Telemetry and online updater removed.
+          EOF
+          chmod -R go-w "$DEB_DIR"
+          dpkg-deb --root-owner-group --build "$DEB_DIR" "$OUT/ShellRS-${VERSION}-linux-x86_64.deb"
+
+          # 3. RPM .rpm
+          RPM_TOP="$WORK/rpm"
+          RPM_ROOT="$WORK/rpm-root"
+          install -Dm755 "$WORK/$TAR_NAME/shellrs" "$RPM_ROOT/usr/bin/shellrs"
+          install -Dm644 packaging/linux/shellrs.desktop "$RPM_ROOT/usr/share/applications/shellrs.desktop"
+          install -Dm644 assets/logo/shellrs.png "$RPM_ROOT/usr/share/icons/hicolor/512x512/apps/shellrs.png"
+          install -Dm644 LICENSE "$RPM_ROOT/usr/share/licenses/shellrs/LICENSE"
+          mkdir -p "$RPM_TOP"
+          cat > "$RPM_TOP/shellrs.spec" <<EOF
+          %global debug_package %{nil}
+          %global _build_id_links none
+          %global __brp_strip %{nil}
+          Name: shellrs
+          Version: ${VERSION/-/\~}
+          Release: 1
+          Summary: Native GPU-accelerated SSH host manager (hardened build)
+          License: GPL-3.0-only
+          URL: https://github.com/since2006/shell-rs
+          Recommends: libwayland-client, libxcb, vulkan-loader, mesa-vulkan-drivers
+
+          %description
+          Native GPU-accelerated SSH host manager with terminal, SFTP, port
+          forwarding, and end-to-end encrypted sync. Telemetry and online updater removed.
+
+          %install
+          cp -a "$RPM_ROOT/." "%{buildroot}/"
+
+          %files
+          /usr/bin/shellrs
+          /usr/share/applications/shellrs.desktop
+          /usr/share/icons/hicolor/512x512/apps/shellrs.png
+          %license /usr/share/licenses/shellrs/LICENSE
+          EOF
+          rpmbuild -bb --quiet --target x86_64 --define "_topdir $RPM_TOP" "$RPM_TOP/shellrs.spec"
+          RPM_FILE=$(find "$RPM_TOP/RPMS/x86_64" -maxdepth 1 -type f -name '*.rpm' | head -n 1)
+          test -s "$RPM_FILE"
+          cp "$RPM_FILE" "$OUT/ShellRS-${VERSION}-linux-x86_64.rpm"
+
+          # 4. SHA-256-verified AppImage (appimagetool 1.9.1 + type2-runtime 20251108)
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
+          RUNTIME_SHA="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+
+          curl -fsSL --retry 3 --retry-delay 5 -o "$WORK/appimagetool" "$APPIMAGETOOL_URL"
+          echo "${APPIMAGETOOL_SHA}  $WORK/appimagetool" | sha256sum -c -
+          chmod 755 "$WORK/appimagetool"
+
+          curl -fsSL --retry 3 --retry-delay 5 -o "$WORK/runtime-x86_64" "$RUNTIME_URL"
+          echo "${RUNTIME_SHA}  $WORK/runtime-x86_64" | sha256sum -c -
+
+          APPDIR="$WORK/ShellRS.AppDir"
+          install -Dm755 "$WORK/$TAR_NAME/shellrs" "$APPDIR/usr/bin/shellrs"
+          install -Dm644 packaging/linux/shellrs.desktop "$APPDIR/shellrs.desktop"
+          install -Dm644 assets/logo/shellrs.png "$APPDIR/shellrs.png"
+          ln -s shellrs.png "$APPDIR/.DirIcon"
+          ln -s usr/bin/shellrs "$APPDIR/AppRun"
+
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 VERSION="$VERSION" \
+            "$WORK/appimagetool" --no-appstream --runtime-file "$WORK/runtime-x86_64" \
+            "$APPDIR" "$OUT/ShellRS-${VERSION}-linux-x86_64.AppImage"
+          test -s "$OUT/ShellRS-${VERSION}-linux-x86_64.AppImage"
+          ls -la "$OUT"
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shell-rs-linux-x86_64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-windows:
+    name: Build Windows x86_64 (Inno Setup + Portable zip)
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: since2006/shell-rs
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shell-rs/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shell-rs 安全补丁"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Install pinned Rust toolchain from upstream rust-toolchain.toml
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Install NASM 2.16.03 with hardcoded SHA-256 verification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip'
+          $expected = '3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6'
+          $zip = Join-Path $env:RUNNER_TEMP 'nasm-2.16.03-win64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'nasm'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "NASM SHA-256 mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $nasmDir = (Get-ChildItem -Path $dest -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path (Join-Path $nasmDir 'nasm.exe'))) {
+            throw "nasm.exe not found under $nasmDir"
+          }
+          $nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build hardened Windows binaries (no telemetry/updater channel)
+        working-directory: ./app-src
+        shell: bash
+        env:
+          SHELLRS_COMMIT: ${{ needs.check-version.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          export SHELLRS_BUILD_DATE=$(date -u +%Y-%m-%d)
+          unset SHELLRS_UPDATE_CHANNEL
+          cargo build --release --locked --bins
+          test -f target/release/shellrs.exe
+          test -f target/release/shellrs-cli.exe
+          git diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Verify zero MSVC runtime DLL dependency
+        working-directory: ./app-src
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows-runtime.ps1 target/release
+
+      - name: Package Windows Inno Setup installer and portable zip
+        working-directory: ./app-src
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:UPSTREAM_TAG.TrimStart('v')
+          $outDir = Join-Path (Resolve-Path '..').Path 'release-assets'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          # 1. Inno Setup installer using preinstalled ISCC.exe (never choco install)
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Preinstalled Inno Setup 6 ISCC.exe not found at $iscc"
+          }
+          $buildDir = (Resolve-Path 'target\release').Path
+          & $iscc "/DAppVersion=$version" "/DBuildDir=$buildDir" "/O$outDir" packaging\windows\shellrs.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setupExe = Join-Path $outDir "ShellRS-$version-windows-x86_64-setup.exe"
+          if (-not (Test-Path $setupExe)) {
+            throw "Expected Inno Setup output not found: $setupExe"
+          }
+
+          # 2. Portable zip with empty data/ directory via 7-Zip
+          $stage = Join-Path $env:RUNNER_TEMP 'shellrs-portable'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'data') | Out-Null
+          Copy-Item 'target\release\shellrs.exe', 'target\release\shellrs-cli.exe' $stage
+          $zip = Join-Path $outDir "ShellRS-$version-windows-x86_64-portable.zip"
+          Push-Location $stage
+          7z a -tzip -mx=9 $zip shellrs.exe shellrs-cli.exe data
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          $entries = 7z l -slt $zip | Select-String '^Path = ' |
+            ForEach-Object { $_.Line.Substring(7) } | Select-Object -Skip 1
+          if (Compare-Object @($entries) @('data', 'shellrs-cli.exe', 'shellrs.exe')) {
+            throw "Portable zip entries mismatch: $($entries -join ', ')"
+          }
+          Get-ChildItem $outDir
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shell-rs-windows-x86_64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }} (dmg + app.zip)
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: since2006/shell-rs
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shell-rs/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shell-rs 安全补丁"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Install pinned Rust toolchain and macOS target
+        working-directory: ./app-src
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add "${ARCH}-apple-darwin"
+          rustc --version
+
+      - name: Build hardened macOS app, ad-hoc sign, and package dmg + app.zip
+        working-directory: ./app-src
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+          SHELLRS_COMMIT: ${{ needs.check-version.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          export SHELLRS_BUILD_DATE=$(date -u +%Y-%m-%d)
+          unset SHELLRS_UPDATE_CHANNEL
+
+          cargo build --release --locked --bin shellrs --target "${ARCH}-apple-darwin"
+          git diff --exit-code Cargo.toml Cargo.lock
+
+          lipo "target/${ARCH}-apple-darwin/release/shellrs" -verify_arch "${ARCH/aarch64/arm64}"
+
+          mkdir -p build ../release-assets
+          packaging/macos/bundle.sh "target/${ARCH}-apple-darwin/release/shellrs" "$VERSION" "$GITHUB_RUN_NUMBER" build
+          codesign --force --deep --sign - --timestamp=none build/ShellRS.app
+          codesign --verify --deep --strict --verbose=2 build/ShellRS.app
+
+          # 1. Portable app.zip
+          ditto -c -k --keepParent build/ShellRS.app "../release-assets/ShellRS-${VERSION}-macos-${ARCH}.app.zip"
+
+          # 2. Native hdiutil DMG installer
+          DMG_STAGE="$RUNNER_TEMP/dmg-${ARCH}"
+          rm -rf "$DMG_STAGE"
+          mkdir -p "$DMG_STAGE"
+          cp -R build/ShellRS.app "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          DMG="../release-assets/ShellRS-${VERSION}-macos-${ARCH}.dmg"
+          SIZE=$(( $(du -sm "$DMG_STAGE" | cut -f1) * 2 + 20 ))
+          for attempt in 1 2 3; do
+            hdiutil create -volname ShellRS -srcfolder "$DMG_STAGE" -ov \
+              -fs HFS+ -size "${SIZE}m" -format UDZO "$DMG" && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+          ls -la ../release-assets
+
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shell-rs-macos-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, archive-source, build-linux, build-windows, build-macos]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: source-*
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "shell-rs-${VERSION}-source.tar.gz"
+            "ShellRS-${VERSION}-linux-x86_64.tar.gz"
+            "ShellRS-${VERSION}-linux-x86_64.deb"
+            "ShellRS-${VERSION}-linux-x86_64.rpm"
+            "ShellRS-${VERSION}-linux-x86_64.AppImage"
+            "ShellRS-${VERSION}-windows-x86_64-setup.exe"
+            "ShellRS-${VERSION}-windows-x86_64-portable.zip"
+            "ShellRS-${VERSION}-macos-aarch64.dmg"
+            "ShellRS-${VERSION}-macos-aarch64.app.zip"
+            "ShellRS-${VERSION}-macos-x86_64.dmg"
+            "ShellRS-${VERSION}-macos-x86_64.app.zip"
+          )
+
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ShellRS ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated hardened build of [since2006/shell-rs ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/since2006/shell-rs/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            Hardening applied from `patches/shell-rs/` (telemetry & online updater removed, SFTP symlink/filepart hardening, HTTPS-only WebDAV/S3 sync, external CLI disabled, `keep_output` defaulted off).
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

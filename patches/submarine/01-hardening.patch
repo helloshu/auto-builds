@@ -1,0 +1,1666 @@
+diff --git a/index.html b/index.html
+index b110671..8406233 100644
+--- a/index.html
++++ b/index.html
+@@ -18,22 +18,6 @@
+     <meta name="keywords" content="ssh client, sftp client, ftp client, ftps client, telnet client, vnc viewer, rdp client, remote desktop, terminal, port forwarding, ssh tunnel, socks proxy, folder mirror, ssh-agent, rsync alternative, putty alternative, winscp alternative, mobaxterm alternative, bitvise alternative, termius alternative, remmina alternative, rust ssh client, tauri ssh client, android ssh client, encrypted profile sync, open source ssh, sinaxhpm, submarine" />
+     <meta name="author" content="Sina" />
+     <meta name="robots" content="index, follow, max-image-preview:large" />
+-    <link rel="canonical" href="https://submarine.sinaxhpm.com/" />
+-
+-    <!-- Open Graph (Facebook, LinkedIn, Discord, Slack previews + many AI crawlers) -->
+-    <meta property="og:type" content="website" />
+-    <meta property="og:site_name" content="Submarine" />
+-    <meta property="og:title" content="Submarine — SSH, SFTP, FTP, RDP, VNC &amp; Telnet Client" />
+-    <meta property="og:description" content="Free, open-source SSH, SFTP and FTP client for Windows, macOS, Linux, and Android, with RDP, VNC and Telnet. Terminal + SFTP + tunnels + folder mirror in one native window. MIT licensed." />
+-    <meta property="og:url" content="https://submarine.sinaxhpm.com/" />
+-    <meta property="og:image" content="https://submarine.sinaxhpm.com/og.png" />
+-    <meta property="og:locale" content="en_US" />
+-
+-    <!-- Twitter / X card -->
+-    <meta name="twitter:card" content="summary_large_image" />
+-    <meta name="twitter:title" content="Submarine — SSH, SFTP, FTP, RDP, VNC &amp; Telnet Client" />
+-    <meta name="twitter:description" content="Free SSH + SFTP + FTP client with RDP, VNC and Telnet for Windows, macOS, Linux, Android. Terminal, SFTP, tunnels, folder mirror. Built with Rust + Tauri. MIT licensed." />
+-    <meta name="twitter:image" content="https://submarine.sinaxhpm.com/og.png" />
+ 
+     <!-- Theme color so Android Chrome / installable PWAs match the dark shell -->
+     <meta name="theme-color" content="#0a0a0c" />
+diff --git a/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties b/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+index c5f9a53..df3acc5 100644
+--- a/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
++++ b/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,7 @@
+ #Tue May 10 19:22:52 CST 2022
+ distributionBase=GRADLE_USER_HOME
+ distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip
++distributionSha256Sum=bd71102213493060956ec229d946beee57158dbd89d0e62b91bca0fa2c5f3531
+ distributionPath=wrapper/dists
+ zipStorePath=wrapper/dists
+ zipStoreBase=GRADLE_USER_HOME
+diff --git a/src-tauri/src/about.rs b/src-tauri/src/about.rs
+index a86250a..62f25b9 100644
+--- a/src-tauri/src/about.rs
++++ b/src-tauri/src/about.rs
+@@ -41,9 +41,8 @@ pub fn app_info() -> AppInfo {
+     }
+ }
+ 
+-/// See `AppInfo::updates`: off in the App Store's and Google Play's builds
+-/// (both with the `app-store` feature), and in a Flatpak.
+-const UPDATES: bool = !cfg!(any(target_os = "ios", feature = "app-store"));
++/// Updates are disabled in hardened builds.
++const UPDATES: bool = false;
+ fn updates() -> bool {
+     UPDATES && !in_flatpak()
+ }
+@@ -56,18 +55,14 @@ pub struct UpdateInfo {
+     /// `None` if the API call failed or no release exists.
+     pub latest: Option<String>,
+     /// True when the highest published, non-prerelease release on GitHub is a
+-    /// strictly newer semver than the running build (per-component NUMERIC
+-    /// compare — see `semver_greater`). Frontend uses this to colour the
+-    /// banner (green = up-to-date, amber = update available).
++    /// strictly newer semver than the running build.
+     pub has_update: bool,
+-    /// Direct link to the latest release page. Frontend shows an "Open
+-    /// release notes" button when has_update is true.
++    /// Direct link to the latest release page.
+     pub release_url: Option<String>,
+ }
+ 
+ /// Subset of GitHub's `/releases/latest` JSON we actually care about.
+-/// Marked non_exhaustive-friendly via #[serde(default)] so a future
+-/// addition / rename on GitHub's side doesn't break us.
++#[allow(dead_code)]
+ #[derive(Debug, serde::Deserialize)]
+ struct GhRelease {
+     #[serde(default)]
+@@ -80,90 +75,14 @@ struct GhRelease {
+     prerelease: bool,
+ }
+ 
+-/// Ask GitHub which release is newest and whether it beats the running build.
+-///
+-/// We pull the RELEASES LIST rather than `/releases/latest`: GitHub's "latest"
+-/// flag is date-based (and manually overridable), so a hotfix published on an
+-/// old line could point it at a lower version than what's actually shipped.
+-/// Instead we scan every published, non-prerelease release and pick the highest
+-/// SEMVER ourselves, then compare that to `current`. Anonymous calls are rate-
+-/// limited to ~60/hour per IP — fine for an occasional check. The timeout is
+-/// short so a hung connection can't leave the check spinning.
++/// Update checks are disabled in hardened builds; never contacts GitHub.
+ #[tauri::command]
+ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
+     let current = env!("CARGO_PKG_VERSION").to_string();
+-    // The App Store's builds and a Flatpak: nothing is asked, nothing is offered.
+-    if !updates() {
+-        return Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None });
+-    }
+-    let url = format!("https://api.github.com/repos/{}/releases?per_page=100", GITHUB_REPO);
+-
+-    // Build a fresh client per call rather than holding state — this is
+-    // a one-shot probe, not a hot path. User-Agent is required by the
+-    // GitHub API; an empty/missing UA gets a 403.
+-    let client = reqwest::Client::builder()
+-        .timeout(std::time::Duration::from_secs(6))
+-        .user_agent(concat!("submarine-app/", env!("CARGO_PKG_VERSION")))
+-        .build()
+-        .map_err(|e| format!("[UPDATE] CLIENT: {}", e))?;
+-
+-    let resp = client
+-        .get(&url)
+-        .header("Accept", "application/vnd.github+json")
+-        .send()
+-        .await
+-        .map_err(|e| format!("[UPDATE] NETWORK: {}", e))?;
+-
+-    if !resp.status().is_success() {
+-        // 404 means the repo path is wrong; anything else is a transient
+-        // GitHub / rate-limit error. Either way, don't nag — report "no
+-        // newer release known" so the UI stays quiet rather than scary.
+-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+-            return Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None });
+-        }
+-        return Err(format!("[UPDATE] HTTP {}", resp.status()));
+-    }
+-
+-    // An empty repo returns `[]` (200), not 404 — handled naturally below.
+-    // The list of releases is a few hundred KB at most; read no more than 8 MB.
+-    let bytes = crate::cloud::read_capped(resp, 8 * 1024 * 1024).await.map_err(|e| format!("[UPDATE] {}", e))?;
+-    let releases: Vec<GhRelease> = serde_json::from_slice(&bytes).map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
+-
+-    // Highest published, non-prerelease semver wins. Drafts are only visible
+-    // with auth (we're anonymous) but we skip them defensively all the same.
+-    let mut best: Option<(String, String)> = None; // (clean_version, html_url)
+-    for r in releases {
+-        if r.draft || r.prerelease || r.tag_name.is_empty() {
+-            continue;
+-        }
+-        let clean = r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string();
+-        let wins = match &best {
+-            None => true,
+-            Some((cur_best, _)) => semver_greater(&clean, cur_best),
+-        };
+-        if wins {
+-            best = Some((clean, r.html_url));
+-        }
+-    }
+-
+-    match best {
+-        None => Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None }),
+-        Some((latest_clean, html_url)) => {
+-            let has_update = semver_greater(&latest_clean, &current);
+-            Ok(UpdateInfo {
+-                current,
+-                latest: Some(latest_clean),
+-                has_update,
+-                release_url: if html_url.is_empty() { None } else { Some(html_url) },
+-            })
+-        }
+-    }
++    Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None })
+ }
+ 
+-/// True when `a > b` under dotted-number compare (ignores any non-numeric
+-/// suffix like "-beta"). Robust enough for our semver-tagged releases:
+-/// "0.2.0" > "0.1.5", "1.0.0" > "0.9.9". A pre-release suffix on `a`
+-/// makes it sort EQUAL to the same base — preferring stable over pre.
++#[allow(dead_code)]
+ fn semver_greater(a: &str, b: &str) -> bool {
+     let strip = |s: &str| s.split(['-', '+']).next().unwrap_or(s).to_string();
+     let parse = |s: String| -> Vec<u64> {
+diff --git a/src-tauri/src/ai/mod.rs b/src-tauri/src/ai/mod.rs
+index db051e1..e8e8cf8 100644
+--- a/src-tauri/src/ai/mod.rs
++++ b/src-tauri/src/ai/mod.rs
+@@ -411,16 +411,20 @@ fn open_generation(db: &crate::DbState) -> Option<u64> {
+ }
+ 
+ /// The message about the open profile's store, once.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_store_notice(db: tauri::State<'_, crate::DbState>) -> Result<Option<String>, String> {
++    return Ok(None);
+     let vault = db.db_path.lock().map_err(|_| "[STATE] LOCK_PATH")?.clone();
+     Ok(vault.and_then(|v| take_notice_for(&v)))
+ }
+ 
+ /// Saves the open profile's store now, when one is in memory: Lock asks
+ /// before it goes on without a save that failed, as it does for the vault.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_persist(db: tauri::State<'_, crate::DbState>) -> Result<(), String> {
++    return Ok(());
+     let Some(generation) = open_generation(&db) else { return Ok(()) };
+     tokio::task::spawn_blocking(move || {
+         let mut guard = shared().store.lock().map_err(|_| "[AI] STORE_LOCK")?;
+@@ -437,8 +441,10 @@ pub async fn ai_persist(db: tauri::State<'_, crate::DbState>) -> Result<(), Stri
+     .map_err(|e| format!("[AI] TASK: {e}"))?
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_providers_list(db: tauri::State<'_, crate::DbState>) -> Result<Vec<ProviderView>, String> {
++    return Ok(Vec::new());
+     let views = with_store(profile_keys(&db)?, |s| s.providers()).await?;
+     Ok(views.into_iter().map(store::for_page).collect())
+ }
+@@ -449,8 +455,10 @@ fn moved(before: &ProviderView, after: &ProviderView) -> bool {
+     before.base_url != after.base_url || before.kind != after.kind || before.profile != after.profile
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_provider_save(db: tauri::State<'_, crate::DbState>, input: ProviderInput) -> Result<ProviderView, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let (view, changed) = with_store(profile_keys(&db)?, move |s| {
+         let before = input.id.and_then(|id| s.provider(id).ok()).map(|p| p.view);
+         let id = s.save_provider(&input)?;
+@@ -466,8 +474,10 @@ pub async fn ai_provider_save(db: tauri::State<'_, crate::DbState>, input: Provi
+     Ok(store::for_page(view))
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_provider_delete(db: tauri::State<'_, crate::DbState>, id: i64) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let deleted = with_store(profile_keys(&db)?, move |s| {
+         s.delete_provider(id)?;
+         s.save()
+@@ -486,8 +496,10 @@ fn give_consent(s: &mut Store, provider_id: i64, host: &str) -> Result<(), Strin
+     s.set_consent(provider_id, Some(store::now()))
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_consent(db: tauri::State<'_, crate::DbState>, provider_id: i64, host: String) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         give_consent(s, provider_id, &host)?;
+         s.save()
+@@ -495,8 +507,10 @@ pub async fn ai_consent(db: tauri::State<'_, crate::DbState>, provider_id: i64,
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_consent_withdraw(db: tauri::State<'_, crate::DbState>, provider_id: i64) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         s.set_consent(provider_id, None)?;
+         s.save()
+@@ -504,31 +518,39 @@ pub async fn ai_consent_withdraw(db: tauri::State<'_, crate::DbState>, provider_
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_provider_test(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, id: i64) -> Result<String, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let row = with_store(keys, move |s| s.provider(id)).await?;
+     run::test_provider(&app, &db, row).await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_models(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, id: i64) -> Result<Vec<provider::ModelInfo>, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let row = with_store(keys, move |s| s.provider(id)).await?;
+     run::list_models(&app, &db, row).await
+ }
+ 
+ /// The effort levels the chat header offers for a provider and model.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_effort_levels(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, provider_id: i64, model: String) -> Result<Vec<String>, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let row = with_store(keys, move |s| s.provider(provider_id)).await?;
+     let caps = if row.view.kind == Kind::Anthropic { run::caps(&app, &db, &row, &model, None).await.ok() } else { None };
+     Ok(provider::effort_levels(&run::endpoint(&row), caps.as_ref()))
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chats_list(db: tauri::State<'_, crate::DbState>, filter: ChatFilter, search: Option<String>) -> Result<Vec<ChatSummary>, String> {
++    return Ok(Vec::new());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     let mut list = with_store(keys, move |s| s.chats(&filter, search.as_deref().unwrap_or(""))).await?;
+@@ -587,8 +609,10 @@ fn server_name(db: &crate::DbState, server_uuid: &str) -> Result<String, String>
+ /// A new chat, on the given provider or the default one. A chat about a
+ /// server gets the server prompt with the facts probe's findings, and the
+ /// tools; both stay as they are for the chat's whole life.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_create(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, input: NewChat) -> Result<ChatSummary, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     // A provider with a model comes first: without one nothing happens, the
+     // probe of the server included.
+     let (pid, model) = (input.provider_id, input.model.clone());
+@@ -674,8 +698,10 @@ pub async fn ai_chat_create(app: tauri::AppHandle, db: tauri::State<'_, crate::D
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_load(db: tauri::State<'_, crate::DbState>, chat_id: i64) -> Result<ChatView, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         let view = s.chat_view(chat_id)?;
+         // The AI tab reopens on the server's chat that was open last.
+@@ -688,8 +714,10 @@ pub async fn ai_chat_load(db: tauri::State<'_, crate::DbState>, chat_id: i64) ->
+ }
+ 
+ /// The chat of this server that was open last, if it still exists.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_last_chat(db: tauri::State<'_, crate::DbState>, server_uuid: String) -> Result<Option<i64>, String> {
++    return Ok(None);
+     with_store(profile_keys(&db)?, move |s| {
+         let id = s.meta(&format!("last_chat:{server_uuid}"))?.and_then(|v| v.parse::<i64>().ok());
+         Ok(id.filter(|id| s.chat(*id).is_ok_and(|c| c.server_uuid.as_deref() == Some(server_uuid.as_str()))))
+@@ -699,8 +727,10 @@ pub async fn ai_last_chat(db: tauri::State<'_, crate::DbState>, server_uuid: Str
+ 
+ /// Changes a chat's provider, model, effort or other settings. They apply from
+ /// the next message; the chat gets a line saying what changed.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_settings(db: tauri::State<'_, crate::DbState>, chat_id: i64, settings: ChatSettings) -> Result<ChatSettings, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     if shared().running_chat(chat_id, keys.generation) {
+         return Err("[AI] RUNNING: wait for the answer, or stop it, before changing the chat's settings".into());
+@@ -755,8 +785,10 @@ pub async fn ai_chat_settings(db: tauri::State<'_, crate::DbState>, chat_id: i64
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_rename(db: tauri::State<'_, crate::DbState>, chat_id: i64, title: String) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         s.rename_chat(chat_id, &title)?;
+         s.save()
+@@ -764,8 +796,10 @@ pub async fn ai_chat_rename(db: tauri::State<'_, crate::DbState>, chat_id: i64,
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_delete(db: tauri::State<'_, crate::DbState>, chat_id: i64, clear_activity: Option<bool>) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     stop_chat(chat_id, generation);
+@@ -779,8 +813,10 @@ pub async fn ai_chat_delete(db: tauri::State<'_, crate::DbState>, chat_id: i64,
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chats_delete_all(db: tauri::State<'_, crate::DbState>, clear_activity: Option<bool>) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     let stops: Vec<_> = shared()
+@@ -917,8 +953,10 @@ fn hidden_note(count: usize) -> String {
+ /// Sends the user's message and starts the run that answers it. The answer
+ /// comes as events on `on_event`; the returned number names the run for
+ /// `ai_stop`.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_send(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, input: SendInput, on_event: tauri::ipc::Channel<AiEvent>) -> Result<u64, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     // Text pasted from a terminal or a page can hold Unicode Tag characters:
+     // nothing shows on screen, and a model reads them as words. They never go
+     // out as the user's own message, and the chat says when some were there.
+@@ -972,8 +1010,10 @@ pub async fn ai_send(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>
+ 
+ /// Tries the chat's last message again when it got no answer (an error, a
+ /// Stop), without adding it a second time.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_retry(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, chat_id: i64, session_id: Option<String>, on_event: tauri::ipc::Channel<AiEvent>) -> Result<u64, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     can_run(chat_id, generation)?;
+@@ -1036,8 +1076,10 @@ fn start_run(app: tauri::AppHandle, chat_id: i64, generation: u64, user_seq: i64
+     Ok(run_id)
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_stop(run_id: u64) -> Result<(), String> {
++    return Ok(());
+     if let Some(h) = shared().runs.lock().map_err(|_| "[AI] LOCK")?.get(&run_id) {
+         let _ = h.stop.send(true);
+     }
+@@ -1046,8 +1088,10 @@ pub async fn ai_stop(run_id: u64) -> Result<(), String> {
+ 
+ /// Stops every run of the open profile that acts on this session, whichever
+ /// chat it answers: the AI terminal's Ctrl+C.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_stop_session(db: tauri::State<'_, crate::DbState>, session_id: String) -> Result<(), String> {
++    return Ok(());
+     if let Some(generation) = open_generation(&db) {
+         stop_session(&session_id, generation);
+     }
+@@ -1064,8 +1108,10 @@ fn stop_session(session_id: &str, generation: u64) {
+ 
+ /// The user's answer to a card that waits: allow (and maybe always run that
+ /// exact command), deny with a note, or run a changed command.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_decide(run_id: u64, call_id: String, answer: act::Answer) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let tx = shared().waiters.lock().map_err(|_| "[AI] LOCK")?.remove(&(run_id, call_id));
+     match tx {
+         Some(tx) => {
+@@ -1116,8 +1162,10 @@ pub async fn session_closing(session_id: &str) {
+ 
+ /// The level a server's calls are decided at; with the server's open
+ /// session, Full access when it is on there.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_level_get(db: tauri::State<'_, crate::DbState>, server_uuid: String, session_id: Option<String>) -> Result<String, String> {
++    return Ok("ask".to_string());
+     with_store(profile_keys(&db)?, move |s| Ok(effective_level(s.level(&server_uuid)?, &server_uuid, session_id.as_deref(), s.generation).as_str().to_string())).await
+ }
+ 
+@@ -1136,8 +1184,10 @@ pub struct LevelInfo {
+ 
+ /// What the AI tab's level picker needs: the level now, the saved one,
+ /// whether Auto can be offered, and the server's current name.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_level_info(db: tauri::State<'_, crate::DbState>, server_uuid: String, session_id: Option<String>) -> Result<LevelInfo, String> {
++    return Ok(LevelInfo { level: "ask".into(), saved: "ask".into(), posix: None, files_only: None, name: None });
+     let name = server_name(&db, &server_uuid).ok();
+     // An FTP server is files only by its kind, whatever an older chat's facts say.
+     let ftp = server_is_ftp(&db, &server_uuid);
+@@ -1155,6 +1205,7 @@ pub async fn ai_level_info(db: tauri::State<'_, crate::DbState>, server_uuid: St
+ /// session. Full access needs that session and the server's name typed, and
+ /// is never saved. Any other level ends Full access on the server. A change
+ /// applies from the next tool call; the model is told in its next request.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_level_set(
+     app: tauri::AppHandle,
+@@ -1164,6 +1215,7 @@ pub async fn ai_level_set(
+     session_id: Option<String>,
+     confirm_name: Option<String>,
+ ) -> Result<String, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let level = gate::Level::parse(&level).ok_or("[AI] BAD_LEVEL")?;
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+@@ -1204,8 +1256,10 @@ pub struct ServerLevel {
+ /// Servers whose level isn't the default, for the server cards: the saved
+ /// levels, and Full access where it is on now. A profile that never used the
+ /// assistant has no store, and none is made for this.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_server_levels(db: tauri::State<'_, crate::DbState>) -> Result<Vec<ServerLevel>, String> {
++    return Ok(Vec::new());
+     let keys = profile_keys(&db)?;
+     let open = shared().store.lock().map(|s| s.as_ref().is_some_and(|s| s.generation == keys.generation)).unwrap_or(false);
+     if !open && !store::file_for(&keys.vault).exists() {
+@@ -1230,13 +1284,17 @@ pub async fn ai_server_levels(db: tauri::State<'_, crate::DbState>) -> Result<Ve
+     Ok(list)
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_always_list(db: tauri::State<'_, crate::DbState>, server_uuid: String) -> Result<Vec<String>, String> {
++    return Ok(Vec::new());
+     with_store(profile_keys(&db)?, move |s| s.always(&server_uuid)).await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_always_remove(db: tauri::State<'_, crate::DbState>, server_uuid: String, command: String) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         s.remove_always(&server_uuid, &command)?;
+         s.save()
+@@ -1244,15 +1302,19 @@ pub async fn ai_always_remove(db: tauri::State<'_, crate::DbState>, server_uuid:
+     .await
+ }
+ 
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_activity(db: tauri::State<'_, crate::DbState>, server_uuid: Option<String>) -> Result<Vec<store::ActionView>, String> {
++    return Ok(Vec::new());
+     with_store(profile_keys(&db)?, move |s| s.actions(server_uuid.as_deref(), 500)).await
+ }
+ 
+ /// Clears the activity log, of one server or of all; what Undo needed goes
+ /// with it.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_activity_clear(db: tauri::State<'_, crate::DbState>, server_uuid: Option<String>) -> Result<(), String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     with_store(profile_keys(&db)?, move |s| {
+         s.clear_actions(server_uuid.as_deref())?;
+         s.save()
+@@ -1262,8 +1324,10 @@ pub async fn ai_activity_clear(db: tauri::State<'_, crate::DbState>, server_uuid
+ 
+ /// Stops whatever runs for this chat: a reply, or the summary of
+ /// `ai_chat_continue`.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_stop(db: tauri::State<'_, crate::DbState>, chat_id: i64) -> Result<(), String> {
++    return Ok(());
+     if let Some(generation) = open_generation(&db) {
+         stop_chat(chat_id, generation);
+     }
+@@ -1280,8 +1344,10 @@ pub struct Continued {
+ /// request without tools writes a summary of it, and a new chat on the same
+ /// server and settings starts with that summary in its composer. The old chat
+ /// stays as it is. The summary request replays no earlier thinking.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_chat_continue(app: tauri::AppHandle, db: tauri::State<'_, crate::DbState>, chat_id: i64, session_id: Option<String>) -> Result<Continued, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     can_run(chat_id, generation)?;
+@@ -1375,8 +1441,10 @@ impl Drop for RunGuard {
+ }
+ 
+ /// The commands of a chat, for the AI terminal to replay.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_terminal_replay(db: tauri::State<'_, crate::DbState>, chat_id: i64) -> Result<Vec<serde_json::Value>, String> {
++    return Ok(Vec::new());
+     with_store(profile_keys(&db)?, move |s| {
+         let view = s.chat_view(chat_id)?;
+         Ok(view.items.into_iter().filter_map(|i| i.get("calls").and_then(|c| c.as_array()).cloned()).flatten().collect())
+@@ -1397,6 +1465,7 @@ fn undo_matches(e: &store::UndoEntry, path: &str, chat_id: Option<i64>) -> Resul
+ /// assistant created). When the file changed since, it asks first: `force`
+ /// is the user's yes. `path` is the file the card shows, and `chat_id` its
+ /// chat (none from the activity log).
++#[allow(unreachable_code)]
+ #[tauri::command]
+ pub async fn ai_undo(
+     app: tauri::AppHandle,
+@@ -1407,6 +1476,7 @@ pub async fn ai_undo(
+     path: String,
+     chat_id: Option<i64>,
+ ) -> Result<String, String> {
++    return Err("[AI] DISABLED: AI assistant is disabled in this build".into());
+     let keys = profile_keys(&db)?;
+     let generation = keys.generation;
+     let e = with_store(keys, move |s| s.undo_entry(action_id)).await?;
+diff --git a/src-tauri/src/cloud.rs b/src-tauri/src/cloud.rs
+index b531460..d6f2d70 100644
+--- a/src-tauri/src/cloud.rs
++++ b/src-tauri/src/cloud.rs
+@@ -402,34 +402,22 @@ impl CloudState {
+         };
+         let base = config.base();
+ 
+-        // A token from another server than the one in use is dropped, not
+-        // sent: a server is never handed another server's credential, also
+-        // when the settings file went missing or a build without the setting
+-        // ran in between.
+-        let stored = match read_stored_token(app) {
+-            Some(tok) if token_is_for(&tok, &base) => Some(tok),
+-            Some(_) => {
+-                delete_stored_token(app);
+-                None
+-            }
+-            None => None,
+-        };
++        let _ = app;
+         let inner = Inner {
+             config,
+             config_error,
+             endpoint: Endpoint::new(base, http),
+-            token: stored.as_ref().map(|s| s.token.clone()),
+-            email: stored.as_ref().map(|s| s.email.clone()),
++            token: None,
++            email: None,
+             identity: None,
+         };
+         Arc::new(Self { inner: Mutex::new(inner) })
+     }
+ 
+     pub async fn status(&self) -> CloudStatus {
+-        let g = self.inner.lock().await;
+         CloudStatus {
+-            signed_in: g.token.is_some(),
+-            email: g.email.clone(),
++            signed_in: false,
++            email: None,
+         }
+     }
+ 
+@@ -443,11 +431,9 @@ impl CloudState {
+         self.inner.lock().await.endpoint.base.clone()
+     }
+ 
+-    /// The sign-in with its server, for every call a command makes.
++    /// Cloud sync is disabled in hardened builds.
+     pub async fn session(&self) -> Result<Session, String> {
+-        let g = self.inner.lock().await;
+-        let token = g.token.clone().ok_or_else(|| "[CLOUD] NOT_SIGNED_IN".to_string())?;
+-        Ok(Session { endpoint: g.endpoint.clone(), token })
++        Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+     }
+ 
+     /// Persist a new (token, email) pair, issued by the server of `endpoint`,
+@@ -684,63 +670,31 @@ use tauri::Manager as _;
+ // errors leave the stored token untouched. Each takes the server once, at
+ // its start, and a token it gets is stored for that server only.
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_status(state: tauri::State<'_, Arc<CloudState>>) -> Result<CloudStatus, String> {
+-    Ok(state.status().await)
++    Ok(CloudStatus { signed_in: false, email: None })
+ }
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_signup(
+     state: tauri::State<'_, Arc<CloudState>>,
+     email: String,
+ ) -> Result<SignupResponse, String> {
+-    let email = email.trim().to_string();
+-    if email.is_empty() || !email.contains('@') {
+-        return Err("[CLOUD] INVALID_EMAIL".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/signup"))
+-        .json(&SignupRequest { email })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    json_capped::<SignupResponse>(resp, MAX_ANSWER).await
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Exchange a verification token (delivered by email) for a short-lived
+-/// claim_token. The UI then prompts the user for a new password and
+-/// calls `cloud_set_password` with that claim_token. This two-step flow
+-/// keeps the email-delivered token short-lived and single-use while
+-/// letting the user pick the password from inside the app.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_consume_verify_link(
+     state: tauri::State<'_, Arc<CloudState>>,
+     verify_token: String,
+ ) -> Result<VerifyResponse, String> {
+-    let verify_token = verify_token.trim().to_string();
+-    if verify_token.is_empty() {
+-        return Err("[CLOUD] EMPTY_TOKEN".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .get(ep.url("/auth/verify"))
+-        .query(&[("token", &verify_token)])
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    json_capped::<VerifyResponse>(resp, MAX_ANSWER).await
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_set_password(
+     app: tauri::AppHandle,
+@@ -748,28 +702,10 @@ pub async fn cloud_set_password(
+     claim_token: String,
+     password: String,
+ ) -> Result<CloudStatus, String> {
+-    if password.len() < 8 {
+-        return Err("[CLOUD] WEAK_PASSWORD (min 8 chars)".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/set-password"))
+-        .json(&SetPasswordRequest {
+-            claim_token,
+-            password,
+-        })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    let body: AuthTokenResponse = json_capped(resp, MAX_ANSWER).await?;
+-    state.set_token(&app, &ep, body.token, body.email).await?;
+-    Ok(state.status().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_login(
+     app: tauri::AppHandle,
+@@ -777,70 +713,29 @@ pub async fn cloud_login(
+     email: String,
+     password: String,
+ ) -> Result<CloudStatus, String> {
+-    let email = email.trim().to_string();
+-    if email.is_empty() || password.is_empty() {
+-        return Err("[CLOUD] MISSING_CREDENTIALS".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/login"))
+-        .json(&LoginRequest { email, password })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    let body: AuthTokenResponse = json_capped(resp, MAX_ANSWER).await?;
+-    state.set_token(&app, &ep, body.token, body.email).await?;
+-    Ok(state.status().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Best-effort logout: forgets the token here at once, then asks the server
+-/// that issued it to revoke it, waiting a few seconds at most. We do NOT want
+-/// a network failure to leave the user "stuck signed in" — the local token is
+-/// the source of truth for the UI state.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_logout(
+     app: tauri::AppHandle,
+     state: tauri::State<'_, Arc<CloudState>>,
+ ) -> Result<(), String> {
+-    if let Some(session) = state.take_session(&app).await {
+-        revoke(&session).await;
+-    }
+     Ok(())
+ }
+ 
+-/// Deletes the signed-in account on its server: the synced profiles, the
+-/// sharing key, and the shares it owns (for every member). The password is
+-/// asked again, since a token alone can't do this. This device is signed out
+-/// after; the profiles on it stay as they are.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_delete_account(
+     app: tauri::AppHandle,
+     state: tauri::State<'_, Arc<CloudState>>,
+     password: String,
+ ) -> Result<CloudStatus, String> {
+-    let password = zeroize::Zeroizing::new(password);
+-    if password.is_empty() {
+-        return Err("[CLOUD] MISSING_CREDENTIALS".into());
+-    }
+-    let session = state.session().await?;
+-    let request = session
+-        .http()
+-        .post(session.url("/auth/delete-account"))
+-        .json(&DeleteAccountRequest { password: password.as_str() });
+-    if let Err(e) = send_authed(&app, &state, &session, request).await {
+-        return Err(delete_account_error(e));
+-    }
+-    // The server dropped the account and every session of it: forget the
+-    // sign-in here too, without asking it to revoke what is gone.
+-    let _ = state.take_session(&app).await;
+-    Ok(state.status().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// What the user is told when the server turns a deletion away.
++#[allow(dead_code)]
+ fn delete_account_error(e: String) -> String {
+     if e.contains("reauth_required") {
+         "[CLOUD] WRONG_PASSWORD: that isn't this account's password. Nothing was deleted.".to_string()
+@@ -851,37 +746,16 @@ fn delete_account_error(e: String) -> String {
+     }
+ }
+ 
+-/// Request a password-reset email. We treat 200 from the server as
+-/// success regardless of whether the email is actually registered —
+-/// the server's anti-enumeration response is intentionally identical
+-/// in both cases. Don't reveal more to the UI than the server does.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_request_password_reset(
+     state: tauri::State<'_, Arc<CloudState>>,
+     email: String,
+ ) -> Result<(), String> {
+-    let email = email.trim().to_string();
+-    if email.is_empty() || !email.contains('@') {
+-        return Err("[CLOUD] INVALID_EMAIL".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/request-reset"))
+-        .json(&EmailOnlyRequest { email })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    Ok(())
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Exchange a reset token + new password for a fresh bearer token. The
+-/// server also wipes every prior auth_token for this user, so any other
+-/// signed-in device gets logged out — the standard expectation after a
+-/// password change.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_reset_password(
+     app: tauri::AppHandle,
+@@ -889,81 +763,26 @@ pub async fn cloud_reset_password(
+     reset_token: String,
+     password: String,
+ ) -> Result<CloudStatus, String> {
+-    if password.len() < 8 {
+-        return Err("[CLOUD] WEAK_PASSWORD (min 8 chars)".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/reset-with-token"))
+-        .json(&ResetWithTokenRequest {
+-            reset_token,
+-            password,
+-        })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    let body: AuthTokenResponse = json_capped(resp, MAX_ANSWER).await?;
+-    state.set_token(&app, &ep, body.token, body.email).await?;
+-    Ok(state.status().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Request a magic-link sign-in email. Same anti-enumeration response
+-/// shape as request-reset — the UI shows a generic "if registered, check
+-/// your inbox" regardless.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_request_login_link(
+     state: tauri::State<'_, Arc<CloudState>>,
+     email: String,
+ ) -> Result<(), String> {
+-    let email = email.trim().to_string();
+-    if email.is_empty() || !email.contains('@') {
+-        return Err("[CLOUD] INVALID_EMAIL".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/request-login"))
+-        .json(&EmailOnlyRequest { email })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    Ok(())
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Exchange a magic-link token for a bearer token. No password involved —
+-/// the email itself was the authentication factor (possession of inbox
+-/// proves identity). Token is single-use server-side.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_login_with_link(
+     app: tauri::AppHandle,
+     state: tauri::State<'_, Arc<CloudState>>,
+     login_token: String,
+ ) -> Result<CloudStatus, String> {
+-    let login_token = login_token.trim().to_string();
+-    if login_token.is_empty() {
+-        return Err("[CLOUD] EMPTY_TOKEN".into());
+-    }
+-    let ep = state.endpoint().await;
+-    let resp = ep
+-        .http
+-        .post(ep.url("/auth/login-with-link"))
+-        .json(&LoginWithLinkRequest { login_token })
+-        .send()
+-        .await
+-        .map_err(network)?;
+-    if !resp.status().is_success() {
+-        return Err(decode_error(resp).await);
+-    }
+-    let body: AuthTokenResponse = json_capped(resp, MAX_ANSWER).await?;
+-    state.set_token(&app, &ep, body.token, body.email).await?;
+-    Ok(state.status().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src-tauri/src/cloud_config.rs b/src-tauri/src/cloud_config.rs
+index 05368fd..5846985 100644
+--- a/src-tauri/src/cloud_config.rs
++++ b/src-tauri/src/cloud_config.rs
+@@ -298,6 +298,7 @@ pub async fn cloud_get_config(state: tauri::State<'_, Arc<CloudState>>) -> Resul
+ /// Saves the server and proxy settings. Switching to another server signs
+ /// this device out first: the old sign-in is revoked on the server that
+ /// issued it (best effort, briefly), and no profile is moved.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_set_config(
+     app: tauri::AppHandle,
+@@ -305,34 +306,14 @@ pub async fn cloud_set_config(
+     server: String,
+     proxy: ProxyConfig,
+ ) -> Result<CloudConfigView, String> {
+-    let config = CloudConfig {
+-        server: normalize_server(&server)?.unwrap_or_default(),
+-        proxy: normalize_proxy(&proxy)?,
+-    };
+-    if let Some(old) = state.switch_config(&app, config).await? {
+-        cloud::revoke(&old).await;
+-    }
+-    Ok(state.config_view().await)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+-/// Checks that a server answers, with the given proxy setting, before the
+-/// Cloud panel saves it: `GET <server>/health`, which no sign-in goes with.
+-/// Returns how long the answer took, in milliseconds.
++/// Checks that a server answers (disabled in hardened builds).
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn cloud_test_connection(server: String, proxy: ProxyConfig) -> Result<u64, String> {
+-    let base = normalize_server(&server)?.unwrap_or_else(|| CLOUD_API_BASE.to_string());
+-    let proxy = normalize_proxy(&proxy)?;
+-    let client = build_client(&base, &proxy, CHECK_TIMEOUT)?;
+-    let started = Instant::now();
+-    let resp = client
+-        .get(format!("{}/health", cloud::request_root(&base)))
+-        .send()
+-        .await
+-        .map_err(|e| format!("[CLOUD] NETWORK: {}", cloud::describe_send_error(&e)))?;
+-    if !resp.status().is_success() {
+-        return Err(cloud::decode_error(resp).await);
+-    }
+-    Ok(started.elapsed().as_millis() as u64)
++    Err("[CLOUD] DISABLED: cloud sync is disabled in this build".into())
+ }
+ 
+ #[cfg(test)]
+diff --git a/src-tauri/src/feedback.rs b/src-tauri/src/feedback.rs
+index 57ecfc4..ebebffa 100644
+--- a/src-tauri/src/feedback.rs
++++ b/src-tauri/src/feedback.rs
+@@ -14,12 +14,15 @@
+ //! character or an emoji is one, as a letter is. Nothing the person wrote is
+ //! cut; a text over a limit is refused before anything is sent.
+ 
++#[allow(unused_imports)]
+ use std::time::Duration;
+ 
++#[allow(unused_imports)]
+ use reqwest::header::{CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::cloud::CLOUD_API_ROOT;
++#[allow(unused_imports)]
+ use crate::cloud_config::{self, ProxyConfig};
+ 
+ pub const MESSAGE_MIN: usize = 5;
+@@ -29,7 +32,9 @@ pub const EMAIL_MAX: usize = 254;
+ /// The server refuses bodies over 32 KB. The largest valid message (4,000
+ /// four-byte characters, or 4,000 quotes escaped to two bytes each) stays far
+ /// under it; this is the check that it does.
++#[allow(dead_code)]
+ const BODY_MAX: usize = 32 * 1024;
++#[allow(dead_code)]
+ const TIMEOUT: Duration = Duration::from_secs(20);
+ 
+ #[derive(Debug, Deserialize)]
+@@ -137,55 +142,15 @@ pub fn outcome(status: u16, content_type: &str, retry_after_header: Option<&str>
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn endpoint() -> String {
+-    // A debug build (the lab copies) can send to the staging API instead.
+-    #[cfg(debug_assertions)]
+-    if let Ok(url) = std::env::var("SUBMARINE_LAB_FEEDBACK_URL") {
+-        if !url.trim().is_empty() {
+-            return url.trim().to_string();
+-        }
+-    }
+     format!("{}/feedback", CLOUD_API_ROOT)
+ }
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn send_feedback(app: tauri::AppHandle, input: FeedbackInput) -> Result<FeedbackOutcome, String> {
+-    let body = match build_body(&input) {
+-        Ok(b) => serde_json::to_vec(&b).map_err(|e| format!("[FEEDBACK] {}", e))?,
+-        Err(field) => return Ok(FeedbackOutcome::BadField { field }),
+-    };
+-    if body.len() > BODY_MAX {
+-        return Ok(FeedbackOutcome::BadField { field: "message".into() });
+-    }
+-    let url = endpoint();
+-    let (config, _) = cloud_config::load(&app);
+-    // A saved proxy that can't be used falls back to the system's, as sync does.
+-    let http = cloud_config::build_client(&url, &config.proxy, TIMEOUT)
+-        .or_else(|_| cloud_config::build_client(&url, &ProxyConfig::default(), TIMEOUT))?;
+-    let res = match http
+-        .post(&url)
+-        .header(USER_AGENT, "submarine-app")
+-        .header(CONTENT_TYPE, "application/json")
+-        .body(body)
+-        .send()
+-        .await
+-    {
+-        Ok(r) => r,
+-        Err(_) => return Ok(FeedbackOutcome::Offline),
+-    };
+-    let status = res.status().as_u16();
+-    let content_type = res
+-        .headers()
+-        .get(CONTENT_TYPE)
+-        .and_then(|v| v.to_str().ok())
+-        .unwrap_or("")
+-        .to_string();
+-    let retry = res.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()).map(str::to_string);
+-    let bytes = match res.bytes().await {
+-        Ok(b) => b,
+-        Err(_) => return Ok(FeedbackOutcome::Offline),
+-    };
+-    Ok(outcome(status, &content_type, retry.as_deref(), &bytes))
++    Ok(FeedbackOutcome::Offline)
+ }
+ 
+ #[cfg(test)]
+diff --git a/src-tauri/src/gateway/hub.rs b/src-tauri/src/gateway/hub.rs
+index 927b7e1..cb01dff 100644
+--- a/src-tauri/src/gateway/hub.rs
++++ b/src-tauri/src/gateway/hub.rs
+@@ -173,24 +173,8 @@ pub fn hub() -> &'static Arc<Hub> {
+     })
+ }
+ 
+-/// Called once when the app starts: reads this device's settings, and
+-/// listens if the user had turned agent access on.
+-pub fn setup(app: &tauri::AppHandle) {
+-    let hub = hub();
+-    let _ = hub.app.set(app.clone());
+-    let (config, notice) = load_config(app);
+-    let enabled = config.enabled;
+-    if let Ok(mut c) = hub.config.lock() {
+-        *c = config;
+-    }
+-    if let Ok(mut n) = hub.config_notice.lock() {
+-        *n = notice;
+-    }
+-    if enabled {
+-        // The pipe needs the async runtime, which `setup` isn't on.
+-        tauri::async_runtime::spawn(async move { hub.start() });
+-    }
+-}
++/// Agent gateway is disabled in hardened builds.
++pub fn setup(_app: &tauri::AppHandle) {}
+ 
+ // --- what the page is shown ---------------------------------------------------
+ 
+@@ -933,116 +917,15 @@ pub async fn gateway_overview() -> Result<Overview, String> {
+     Ok(hub().overview())
+ }
+ 
+-/// Turns agent access on or off on this device, or sets the longest grant.
++/// Agent gateway is disabled in hardened builds.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_configure(app: tauri::AppHandle, enabled: Option<bool>, longest_minutes: Option<u32>) -> Result<Overview, String> {
+-    let hub = hub();
+-    let (config, was) = {
+-        let mut c = hub.config.lock().map_err(|_| "[GATEWAY] LOCK")?;
+-        let was = c.enabled;
+-        if let Some(on) = enabled {
+-            c.enabled = on;
+-        }
+-        if let Some(m) = longest_minutes {
+-            c.longest_minutes = m.clamp(1, grant::MAX_MINUTES);
+-        }
+-        (c.clone(), was)
+-    };
+-    save_config(&app, &config)?;
+-    if let Ok(mut n) = hub.config_notice.lock() {
+-        *n = None;
+-    }
+-    if config.enabled && !was {
+-        hub.start();
+-    } else if !config.enabled && was {
+-        hub.stop().await;
+-    } else if config.enabled {
+-        // On already, but it may have failed to listen: try again.
+-        hub.start();
+-    }
+-    hub.bump();
+-    Ok(hub.overview())
+-}
+-
+-struct ServerRow {
+-    session: String,
+-    name: String,
+-    host: String,
+-    proxy_host: Option<String>,
+-    jump_host: Option<String>,
+-    /// An FTP server (FTP, FTPS): files only.
+-    ftp: bool,
+-}
+-
+-/// The server the user picked, from the profile itself: it must exist and be
+-/// an SSH or an FTP server.
+-fn server_row(db: &crate::DbState, uuid: &str) -> Result<ServerRow, String> {
+-    let conn = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+-    let conn = conn.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+-    let (id, name, host, protocol, proxy_host, jump): (i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+-        .query_row("SELECT id, name, host, protocol, proxy_host, jump_host_id FROM servers WHERE uuid = ?1 AND COALESCE(deleted, 0) = 0", [uuid], |r| {
+-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+-        })
+-        .map_err(|_| "[GATEWAY] NO_SERVER: that server no longer exists".to_string())?;
+-    let protocol = protocol.unwrap_or_default().to_ascii_lowercase();
+-    let ftp = crate::ftp::Security::of_protocol(Some(protocol.as_str())).is_some();
+-    if !ftp && !protocol.is_empty() && protocol != "ssh" {
+-        return Err("[GATEWAY] NOT_SSH: agents can work on SSH and FTP servers only".into());
+-    }
+-    let jump_host = jump.and_then(|j| conn.query_row("SELECT host FROM servers WHERE id = ?1", [j], |r| r.get::<_, Option<String>>(0)).ok().flatten());
+-    Ok(ServerRow { session: format!("session-{id}"), name: name.unwrap_or_default(), host: host.unwrap_or_default(), proxy_host, jump_host, ftp })
+-}
+-
+-/// The folders the user gave a grant's file operations, resolved on the
+-/// server now, each to a place that is there: the grant holds where they
+-/// are, not names that could lead somewhere else later. `~` and a relative
+-/// path start at the login's own folder.
+-async fn resolve_folders(fs: &crate::ai::files::Fs, folders: &[String]) -> Result<Vec<String>, String> {
+-    if folders.len() > grant::MAX_FOLDERS {
+-        return Err(format!("[GATEWAY] TOO_MANY_FOLDERS: at most {} folders", grant::MAX_FOLDERS));
+-    }
+-    let home = fs.home().await.map_err(|e| format!("[GATEWAY] NO_HOME: {e}"))?;
+-    let mut out = Vec::new();
+-    for f in folders.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
+-        let shown = shape::cut(f, 200);
+-        let f = ai_tools::check_path(f.to_string()).map_err(|e| format!("[GATEWAY] BAD_FOLDER: {shown}: {e}"))?;
+-        let res = fs.resolve(&ai_tools::absolute(&f, &home)).await.map_err(|e| format!("[GATEWAY] BAD_FOLDER: {shown}: {e}"))?;
+-        if !res.exists {
+-            return Err(format!("[GATEWAY] NO_FOLDER: {shown} isn't on the server"));
+-        }
+-        if !out.contains(&res.path) {
+-            out.push(res.path);
+-        }
+-    }
+-    Ok(out)
+-}
+-
+-/// What Submarine knows about where a server is: the host as saved, the
+-/// addresses that name gives now, and the same for its proxy and jump host.
+-async fn mask_for(row: &ServerRow) -> Mask {
+-    let mut values: Vec<String> = vec![row.host.clone()];
+-    values.extend(row.proxy_host.clone());
+-    values.extend(row.jump_host.clone());
+-    let mut found = Vec::new();
+-    for name in &values {
+-        let name = name.trim();
+-        if name.is_empty() || name.parse::<std::net::IpAddr>().is_ok() {
+-            continue;
+-        }
+-        // The addresses a host name stands for today. A lookup that fails
+-        // or takes long adds nothing; the name itself is still hidden.
+-        if let Ok(Ok(addresses)) = tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host((name, 22))).await {
+-            found.extend(addresses.map(|a| a.ip().to_string()));
+-        }
+-    }
+-    values.extend(found);
+-    Mask::new(values.iter().map(String::as_str))
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
+-/// The user approves a request. The server, the operations, the folders,
+-/// the way they run and the time are the page's own arguments: what the
+-/// agent asked for is only what the card started from.
+ #[allow(clippy::too_many_arguments)]
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_approve(
+     app: tauri::AppHandle,
+@@ -1055,119 +938,37 @@ pub async fn gateway_approve(
+     minutes: Option<u32>,
+     label: Option<String>,
+ ) -> Result<(), String> {
+-    let hub = hub();
+-    let keys = ai::profile_keys(&db)?;
+-    let generation = keys.generation;
+-    let row = server_row(&db, &server_uuid)?;
+-    // The server's session must be open: the grant acts through it, and
+-    // every question a connection asks (host key, password) was the user's
+-    // to answer in its own tab.
+-    const NOT_OPEN: &str = "[GATEWAY] NOT_CONNECTED: open the server first; an agent works through its open session";
+-    let reach = if row.ftp {
+-        Reach::Ftp(act::ftp_reach(&app, &row.session).await.ok_or(NOT_OPEN)?)
+-    } else {
+-        Reach::Ssh(act::connection(&app, &row.session).await.ok_or(NOT_OPEN)?)
+-    };
+-    // The folders, with file operations only, resolved through the file
+-    // access the grant then keeps.
+-    let folders = folders.unwrap_or_default();
+-    let (folders, fs) = if ops.iter().any(|o| o.files()) && !folders.is_empty() {
+-        let fs = reach.open_fs().await.map_err(|e| format!("[GATEWAY] NO_FILES: {e}"))?;
+-        (resolve_folders(&fs, &folders).await?, Some(fs))
+-    } else {
+-        (Vec::new(), None)
+-    };
+-    // What can't be written down doesn't get granted.
+-    ai::with_store(keys, |_| Ok(())).await?;
+-    let mask = mask_for(&row).await;
+-    let longest = hub.config.lock().map(|c| c.longest_minutes).unwrap_or(grant::DEFAULT_MINUTES);
+-    let approval = Approval { server: server_uuid, session: row.session.clone(), server_name: row.name, server_host: row.host, label, ops, folders, ftp: row.ftp, mode, minutes, mask: mask.clone() };
+-    let (g, event) = {
+-        let mut s = hub.state.lock().map_err(|_| "[GATEWAY] LOCK")?;
+-        let g = s.approve(&request, approval, Now::read(), generation, longest)?;
+-        let detail = format!(
+-            "{} · {} · {} min",
+-            g.ops.iter().map(|o| o.as_str()).collect::<Vec<_>>().join(", "),
+-            serde_json::to_value(g.mode).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(),
+-            g.until.minutes_left(Now::read())
+-        );
+-        let event = AgentEvent { kind: "approved".into(), agent: Hub::who(&s, g.connection), connection: g.connection, grant: Some(g.id.clone()), server_uuid: Some(g.server.clone()), detail };
+-        (g, event)
+-    };
+-    if let Ok(mut l) = hub.live.lock() {
+-        l.insert(g.id.clone(), Arc::new(Live::new(reach, row.session, mask, fs)));
+-    }
+-    hub.write_events(vec![event]).await;
+-    hub.bump();
+-    Ok(())
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_deny(request: String, note: Option<String>) -> Result<(), String> {
+-    let hub = hub();
+-    let note = note.map(|n| shape::strip_tags(&n).split_whitespace().collect::<Vec<_>>().join(" ")).map(|n| shape::cut(&n, 500).to_string()).filter(|n| !n.is_empty());
+-    let event = {
+-        let mut s = hub.state.lock().map_err(|_| "[GATEWAY] LOCK")?;
+-        let connection = s.waiting().find(|r| r.id == request).map(|r| r.connection);
+-        s.deny(&request, note.clone(), Instant::now())?;
+-        connection.map(|c| AgentEvent { kind: "denied".into(), agent: Hub::who(&s, c), connection: c, grant: None, server_uuid: None, detail: note.unwrap_or_default() })
+-    };
+-    hub.write_events(event.into_iter().collect()).await;
+-    hub.bump();
+-    Ok(())
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
+-/// The user takes a grant back. What runs under it is stopped.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_revoke(access: String) -> Result<(), String> {
+-    let hub = hub();
+-    let ended = {
+-        let mut s = hub.state.lock().map_err(|_| "[GATEWAY] LOCK")?;
+-        let g = s.end(None, &access, End::Revoked);
+-        g.map(|g| {
+-            let e = hub.ended_event(&s, &g, End::Revoked);
+-            (g, e)
+-        })
+-    };
+-    let Some((g, e)) = ended else { return Err("[GATEWAY] NO_GRANT: that access has ended already".into()) };
+-    hub.write_events(vec![e]).await;
+-    hub.wind_down(std::slice::from_ref(&g), End::Revoked).await;
+-    hub.bump();
+-    Ok(())
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
+-/// The user disconnects an agent: its grants end with its connection.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_disconnect(connection: u64) -> Result<(), String> {
+-    let kick = hub().kicks.lock().map_err(|_| "[GATEWAY] LOCK")?.get(&connection).cloned();
+-    match kick {
+-        Some(kick) => {
+-            let _ = kick.send(true);
+-            Ok(())
+-        }
+-        None => Err("[GATEWAY] NO_CONNECTION: that agent has disconnected already".into()),
+-    }
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
+-/// The user's answer to a call's card.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_decide(call_id: String, answer: Answer) -> Result<(), String> {
+-    let hub = hub();
+-    let card = hub.cards.lock().map_err(|_| "[GATEWAY] LOCK")?.remove(&call_id);
+-    match card {
+-        Some(card) => {
+-            let _ = card.answer.send(answer);
+-            hub.bump();
+-            Ok(())
+-        }
+-        None => Err("[GATEWAY] NOT_WAITING: that call no longer waits for an answer".into()),
+-    }
++    Err("[GATEWAY] DISABLED: agent gateway is disabled in this build".into())
+ }
+ 
+-/// The newest agent events of this profile, for the Agents panel.
++#[allow(unused_variables)]
+ #[tauri::command]
+ pub async fn gateway_events(db: tauri::State<'_, crate::DbState>) -> Result<Vec<AgentEventView>, String> {
+-    ai::with_store(ai::profile_keys(&db)?, |s| s.agent_events(300)).await
++    Ok(Vec::new())
+ }
+ 
+ #[cfg(test)]
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index dea2c27..cc94a13 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -8151,7 +8151,13 @@ async fn pick_ssh_key_file() -> Result<Option<String>, String> {
+ /// flow. Nothing is written to the vault — the user still reviews the name and
+ /// supplies a passphrase before saving.
+ #[tauri::command]
+-async fn read_ssh_key_file(path: String) -> Result<LoadedSshKey, String> {
++async fn read_ssh_key_file(state: tauri::State<'_, DbState>, path: String) -> Result<LoadedSshKey, String> {
++    {
++        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
++        if conn_guard.is_none() {
++            return Err("[STATE] DATABASE_NOT_INITIALIZED".into());
++        }
++    }
+     // Off the main thread (where a sync command runs) and off the async
+     // workers: a slow or stuck file read mustn't freeze the window.
+     tokio::task::spawn_blocking(move || load_key_from_disk(&expand_home(&path)))
+@@ -21458,14 +21464,43 @@ async fn download_dir_file(
+     if !rel_is_plain || !dest.starts_with(&local_root) {
+         return Err(DirFileEnd::Failed(format!("unsafe path escaped destination: {}", dest.display())));
+     }
+-    if let Some(parent) = dest.parent() {
+-        tokio::fs::create_dir_all(parent).await
+-            .map_err(|e| DirFileEnd::Failed(format!("mkdir {}: {}", parent.display(), e)))?;
+-    }
++    check_local_path_policy(dest.clone()).map_err(DirFileEnd::Failed)?;
++    tokio::fs::create_dir_all(&local_root).await
++        .map_err(|e| DirFileEnd::Failed(format!("mkdir root {}: {}", local_root.display(), e)))?;
++    let canonical_root = std::fs::canonicalize(&local_root)
++        .map_err(|e| DirFileEnd::Failed(format!("canonicalize root {}: {}", local_root.display(), e)))?;
++    let file_name = dest.file_name()
++        .ok_or_else(|| DirFileEnd::Failed(format!("invalid destination: {}", dest.display())))?;
++    if let Ok(meta) = tokio::fs::symlink_metadata(&dest).await {
++        if meta.file_type().is_symlink() {
++            return Err(DirFileEnd::Failed(format!("refusing to overwrite local symlink: {}", dest.display())));
++        }
++    }
++    let parent = dest.parent()
++        .ok_or_else(|| DirFileEnd::Failed(format!("invalid destination parent: {}", dest.display())))?;
++    tokio::fs::create_dir_all(parent).await
++        .map_err(|e| DirFileEnd::Failed(format!("mkdir {}: {}", parent.display(), e)))?;
++    let canonical_parent = std::fs::canonicalize(parent)
++        .map_err(|e| DirFileEnd::Failed(format!("canonicalize parent {}: {}", parent.display(), e)))?;
++    if !canonical_parent.starts_with(&canonical_root) {
++        return Err(DirFileEnd::Failed(format!("unsafe symlink escaped destination: {}", dest.display())));
++    }
++    let dest = canonical_parent.join(file_name);
++    check_local_path_policy(dest.clone()).map_err(DirFileEnd::Failed)?;
+     let mut remote_file = sftp.open(&remote_file_path).await
+         .map_err(|e| DirFileEnd::Failed(format!("open {}: {}", remote_file_path, e)))?;
+     let temp = download_temp_path(&dest);
+-    let mut local_file = tokio::fs::File::create(&temp).await
++    if let Ok(meta) = tokio::fs::symlink_metadata(&temp).await {
++        if !meta.is_file() {
++            return Err(DirFileEnd::Failed(format!("refusing to overwrite non-regular temp path: {}", temp.display())));
++        }
++        let _ = tokio::fs::remove_file(&temp).await;
++    }
++    let mut local_file = tokio::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temp)
++        .await
+         .map_err(|e| DirFileEnd::Failed(format!("create {}: {}", dest.display(), e)))?;
+     let mut buf = vec![0u8; 256 * 1024];
+     let copied: Result<(), DirFileEnd> = async {
+@@ -24324,8 +24359,10 @@ fn parse_filezilla_sites(text: &str) -> Result<Vec<ImportedHost>, String> {
+ /// older ~/.filezilla). The page offers it beside ~/.ssh/config. A lab build
+ /// with `SUBMARINE_LAB_HOME` reads only below that folder, as for
+ /// ~/.ssh/config (ssh_config::home_dir), never the tester's own list.
++#[allow(unreachable_code)]
+ #[tauri::command]
+ fn read_filezilla_sites() -> Result<Vec<ImportedHost>, String> {
++    return Err("Automatic FileZilla credential import is disabled in this build.".into());
+     let lab = cfg!(debug_assertions) && std::env::var("SUBMARINE_LAB_HOME").is_ok_and(|h| !h.is_empty());
+     let mut places: Vec<std::path::PathBuf> = Vec::new();
+     #[cfg(windows)]
+@@ -26244,9 +26281,9 @@ pub fn run() {
+             keep_app_data_out_of_backups(app.handle());
+             let cloud_state = cloud::CloudState::new(&app.handle());
+             app.manage(cloud_state);
+-            // The agent gateway: off unless this device's settings say on.
+-            #[cfg(desktop)]
+-            gateway::hub::setup(app.handle());
++            // Agent gateway is disabled in hardened builds.
++            // #[cfg(desktop)]
++            // gateway::hub::setup(app.handle());
+             // .rdp files an earlier run left behind (issue #3).
+             std::thread::spawn(rdp::clear_old_files);
+             // The keep-alive service, while a connection is open.
+diff --git a/src-tauri/src/mirror.rs b/src-tauri/src/mirror.rs
+index 3d30f1e..96409a4 100644
+--- a/src-tauri/src/mirror.rs
++++ b/src-tauri/src/mirror.rs
+@@ -419,29 +419,56 @@ async fn sftp_download_file(
+     sftp: &SftpSession,
+     remote: &str,
+     local: &Path,
++    local_root: &Path,
+     remote_mtime_secs: Option<u64>,
+ ) -> Result<(), String> {
+     // The root passed the path policy; what the server has under it hasn't: a
+     // mirror of the home folder and a remote `.config/autostart`, say.
+     crate::check_local_path_policy(local.to_path_buf())?;
+-    if let Some(parent) = local.parent() {
+-        tokio::fs::create_dir_all(parent).await
+-            .map_err(|e| format!("local mkdir {:?}: {}", parent, e))?;
+-    }
+-    // Atomic write: stream into `<local>.submarine-tmp` first, then rename
+-    // into place. If the process / network / disk dies mid-download, the
+-    // user is left with the previous good file (if any) PLUS a stray
+-    // .submarine-tmp they can spot and remove — instead of a truncated
+-    // copy stamped with the remote's mtime, which the next dry-run would
+-    // believe is fully synced. Rename is atomic on the same FS volume on
+-    // Windows, Linux, and macOS.
+-    let mut tmp = local.as_os_str().to_owned();
++    tokio::fs::create_dir_all(local_root).await
++        .map_err(|e| format!("local root mkdir {:?}: {}", local_root, e))?;
++    let canonical_root = std::fs::canonicalize(local_root)
++        .map_err(|e| format!("local root canonicalize {:?}: {}", local_root, e))?;
++    let file_name = local
++        .file_name()
++        .ok_or_else(|| format!("invalid local file path: {:?}", local))?;
++    if let Ok(meta) = tokio::fs::symlink_metadata(local).await {
++        if meta.file_type().is_symlink() {
++            return Err(format!("refusing to overwrite local symlink: {:?}", local));
++        }
++    }
++    let parent = local
++        .parent()
++        .ok_or_else(|| format!("invalid local parent path: {:?}", local))?;
++    tokio::fs::create_dir_all(parent).await
++        .map_err(|e| format!("local mkdir {:?}: {}", parent, e))?;
++    let canonical_parent = std::fs::canonicalize(parent)
++        .map_err(|e| format!("local parent canonicalize {:?}: {}", parent, e))?;
++    if !canonical_parent.starts_with(&canonical_root) {
++        return Err(format!(
++            "refusing to write outside mirror root (symlink boundary): {:?}",
++            local
++        ));
++    }
++    let safe_local = canonical_parent.join(file_name);
++    crate::check_local_path_policy(safe_local.clone())?;
++    let mut tmp = safe_local.as_os_str().to_owned();
+     tmp.push(".submarine-tmp");
+     let tmp_path = std::path::PathBuf::from(tmp);
++    if let Ok(meta) = tokio::fs::symlink_metadata(&tmp_path).await {
++        if !meta.is_file() {
++            return Err(format!("refusing to overwrite non-regular temp path: {:?}", tmp_path));
++        }
++        let _ = tokio::fs::remove_file(&tmp_path).await;
++    }
+ 
+     let mut handle = sftp.open(remote).await
+         .map_err(|e| format!("sftp open {}: {}", remote, e))?;
+-    let mut f = tokio::fs::File::create(&tmp_path).await
++    let mut f = tokio::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&tmp_path)
++        .await
+         .map_err(|e| format!("local create {:?}: {}", tmp_path, e))?;
+     let mut buf = vec![0u8; 64 * 1024];
+     loop {
+@@ -464,13 +491,13 @@ async fn sftp_download_file(
+         return Err(format!("local flush: {}", e));
+     }
+     drop(f);
+-    if let Err(e) = tokio::fs::rename(&tmp_path, local).await {
++    if let Err(e) = tokio::fs::rename(&tmp_path, &safe_local).await {
+         let _ = tokio::fs::remove_file(&tmp_path).await;
+-        return Err(format!("local rename {:?} -> {:?}: {}", tmp_path, local, e));
++        return Err(format!("local rename {:?} -> {:?}: {}", tmp_path, safe_local, e));
+     }
+     if let Some(secs) = remote_mtime_secs {
+         let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+-        let _ = filetime::set_file_mtime(local, ft);
++        let _ = filetime::set_file_mtime(&safe_local, ft);
+     }
+     Ok(())
+ }
+@@ -1379,10 +1406,14 @@ async fn walk_remote(
+                 continue;
+             }
+             if is_excluded(&rel, excludes) { continue; }
++            let ft = entry.file_type();
++            if !ft.is_dir() && !ft.is_file() {
++                continue;
++            }
+             path_bytes = path_bytes.saturating_add(rel.len());
+             tree.found.insert(rel.clone(), entry.metadata());
+ 
+-            if entry.file_type().is_dir() {
++            if ft.is_dir() {
+                 if is_excluded(&format!("{}/", rel), excludes) { continue; }
+                 dirs.insert(rel);
+                 path_bytes = path_bytes.saturating_add(remote_path.len());
+@@ -1399,7 +1430,7 @@ async fn walk_remote(
+ /// others (`seen`), and what is left becomes a download-new entry.
+ fn remote_only(tree: &RemoteTree, seen: &HashSet<String>, out: &mut Vec<DryRunEntry>, total: &mut u64) {
+     for (rel, attr) in &tree.found {
+-        if attr.file_type().is_dir() || seen.contains(rel) { continue; }
++        if !attr.file_type().is_file() || seen.contains(rel) { continue; }
+         let size = attr.size.unwrap_or(0);
+         out.push(DryRunEntry { path: rel.clone(), size, action: "download-new".into() });
+         *total = total.saturating_add(size);
+@@ -1652,7 +1683,7 @@ async fn run_mirror(
+                 };
+                 let res = if is_download {
+                     let mt = sftp_remote_mtime(&*sftp, &remote_path).await;
+-                    sftp_download_file(&*sftp, &remote_path, &local_path, mt).await
++                    sftp_download_file(&*sftp, &remote_path, &local_path, &local_root, mt).await
+                 } else {
+                     sftp_upload_file(&*sftp, &local_path, &remote_path).await
+                 };
+@@ -2829,8 +2860,27 @@ mod tests {
+         let lab = Lab::new(&[("/srv", Dir), ("/srv/x.desktop", File)], &[], &[]).await;
+         let root = std::env::temp_dir().join(format!("sub-mirror-policy-{}", std::process::id()));
+         let local = root.join(".config").join("autostart").join("x.desktop");
+-        let err = sftp_download_file(&lab.sftp, "/srv/x.desktop", &local, None).await.unwrap_err();
++        let err = sftp_download_file(&lab.sftp, "/srv/x.desktop", &local, &root, None).await.unwrap_err();
+         assert!(err.contains("auto-run"), "{}", err);
+         assert!(!root.exists());
+     }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn a_mirror_does_not_escape_root_through_local_symlink() {
++        let lab = Lab::new(&[("/srv", Dir), ("/srv/sub", Dir), ("/srv/sub/pwn.txt", File)], &[], &[]).await;
++        let base = std::env::temp_dir().join(format!("sub-mirror-sym-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&base);
++        let root = base.join("root");
++        let outside = base.join("outside");
++        std::fs::create_dir_all(&root).unwrap();
++        std::fs::create_dir_all(&outside).unwrap();
++        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
++
++        let local = root.join("sub").join("pwn.txt");
++        let err = sftp_download_file(&lab.sftp, "/srv/sub/pwn.txt", &local, &root, None).await.unwrap_err();
++        assert!(err.contains("symlink boundary"), "{}", err);
++        assert!(!outside.join("pwn.txt").exists());
++        let _ = std::fs::remove_dir_all(&base);
++    }
+ }
+diff --git a/src-tauri/src/ssh_config.rs b/src-tauri/src/ssh_config.rs
+index c63ef6a..3b3deb8 100644
+--- a/src-tauri/src/ssh_config.rs
++++ b/src-tauri/src/ssh_config.rs
+@@ -40,7 +40,7 @@ const MAX_GLOB: usize = 256;
+ /// `IdentityFile` / `CertificateFile` values kept (OpenSSH's own cap).
+ const MAX_KEY_FILES: usize = 100;
+ 
+-static ENABLED: AtomicBool = AtomicBool::new(true);
++static ENABLED: AtomicBool = AtomicBool::new(false);
+ 
+ /// The device's "Use settings from ~/.ssh/config" switch.
+ pub(crate) fn set_enabled(on: bool) {
+diff --git a/src/components/ProfileSelectPage.tsx b/src/components/ProfileSelectPage.tsx
+index 37afc53..ef1bc3e 100644
+--- a/src/components/ProfileSelectPage.tsx
++++ b/src/components/ProfileSelectPage.tsx
+@@ -3,14 +3,13 @@ import { createPortal } from "react-dom";
+ import { invoke } from "@tauri-apps/api/core";
+ import {
+   AlertTriangle, ArrowBigUp, ArrowRight, ArrowUpCircle, Check, CheckCircle2, Cloud, CloudOff, Download,
+-  Eye, EyeOff, Fingerprint, Github, HardDrive, History, Loader2, MessageSquare, MoreHorizontal, Plus, RefreshCw, ShieldCheck, Trash2, Upload, X,
++  Eye, EyeOff, Fingerprint, Github, HardDrive, History, Loader2, MoreHorizontal, Plus, RefreshCw, ShieldCheck, Trash2, Upload, X,
+ } from "lucide-react";
+ import CloudPanel from "./CloudPanel";
+ import { CloudConfigView, hostOf } from "./SyncServerSetting";
+ import logoUrl from "../assets/logo.png";
+ import { IS_ANDROID, IS_IOS, IS_MOBILE } from "../util/platform";
+ import { PRIVACY_URL } from "../util/links";
+-import { openFeedback } from "./Feedback";
+ import { useTextPrompt, useConfirm } from "../ui/confirm";
+ import { forgetProfileBookmarks } from "../util/sftpBookmarks";
+ import { t, tn, tx, useT } from "../i18n";
+@@ -290,16 +289,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
+ 
+   useEffect(() => { refreshCloud(); }, [refreshCloud]);
+ 
+-  // Check GitHub for a newer release once per app open (this page mounts on
+-  // launch and on every return to the picker). Best-effort and silent: the
+-  // fetch+semver-compare happens in Rust (about::check_for_updates), and any
+-  // failure — offline, rate-limited, no releases — simply shows nothing.
+-  useEffect(() => {
+-    invoke<UpdateInfo>("check_for_updates")
+-      .then((u) => { if (u.has_update && u.latest) setUpdate(u); })
+-      .catch(() => {});
+-  }, []);
+-
+   // A link that can't be opened (no browser / URL handler on this device)
+   // says so under the footer row instead of doing nothing.
+   const [linkError, setLinkError] = useState("");
+@@ -1116,8 +1105,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
+             <FooterButton onClick={openRepo} title={t("Open Submarine on GitHub")} icon={<Github size={12} />} label="GitHub" />
+             <FooterDot />
+             <FooterButton onClick={() => openLink(PRIVACY_URL)} title={t("What Submarine stores and sends: the privacy policy")} icon={<ShieldCheck size={12} />} label={t("Privacy")} />
+-            <FooterDot />
+-            <FooterButton onClick={() => openFeedback()} title={t("Send a message to the developer")} icon={<MessageSquare size={12} />} label={t("Feedback")} />
+             {!update && appInfo?.updates !== false && (
+               <>
+                 <FooterDot />
+diff --git a/src/util/sshConfig.ts b/src/util/sshConfig.ts
+index 851b379..1b6e226 100644
+--- a/src/util/sshConfig.ts
++++ b/src/util/sshConfig.ts
+@@ -6,8 +6,8 @@ export const USE_SSH_CONFIG_KEY = "submarine-use-ssh-config";
+ 
+ export function readUseSshConfig(): boolean {
+   try {
+-    return localStorage.getItem(USE_SSH_CONFIG_KEY) !== "off";
++    return localStorage.getItem(USE_SSH_CONFIG_KEY) === "on";
+   } catch {
+-    return true;
++    return false;
+   }
+ }

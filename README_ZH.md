@@ -24,6 +24,9 @@
 | **LibChecker** | 原生 Kotlin Android 应用架构与原生库查看工具 (FOSS 版) | [LibChecker/LibChecker](https://github.com/LibChecker/LibChecker) | [`build-libchecker.yml`](.github/workflows/build-libchecker.yml) | ![LibChecker Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-libchecker.yml/badge.svg) |
 | **Round Sync** | 基于 Rclone 的 Android 云存储管理与同步客户端 (OSS 版, 4 架构 + universal) | [newhinton/Round-Sync](https://github.com/newhinton/Round-Sync) | [`build-round-sync.yml`](.github/workflows/build-round-sync.yml) | ![Round Sync Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-round-sync.yml/badge.svg) |
 | **Shizuku** | 通过 ADB / Root 调用系统 API 的 Android 服务框架 (内置 `rish` 与原生启动器) | [RikkaApps/Shizuku](https://github.com/RikkaApps/Shizuku) | [`build-shizuku.yml`](.github/workflows/build-shizuku.yml) | ![Shizuku Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shizuku.yml/badge.svg) |
+| **ShellRS** | 安全加固版 Rust / GPUI 原生 SSH 客户端 (Linux x64 tar.gz/deb/rpm/AppImage、Windows x64 安装版/便携版、macOS arm64/x64 dmg/app.zip；移除遥测与在线更新) | [since2006/shell-rs](https://github.com/since2006/shell-rs) | [`build-shell-rs.yml`](.github/workflows/build-shell-rs.yml) | ![ShellRS Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shell-rs.yml/badge.svg) |
+| **shellwing** | 安全加固版 Rust / GPUI / Zig 原生 SSH 客户端 (Linux x64/arm64、Windows x64、macOS arm64/x64、Android 签名 APK、iOS 未签名 IPA；含安全补丁与禁更新) | [hivepaas/shellwing](https://github.com/hivepaas/shellwing) | [`build-shellwing.yml`](.github/workflows/build-shellwing.yml) | ![shellwing Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shellwing.yml/badge.svg) |
+| **Submarine** | 安全加固版 Rust / Tauri SSH 与 SFTP 客户端 (Linux x64、Windows x64 msi/setup/便携版、macOS 通用包、Android 16 KB 对齐 APK、iOS 未签名 IPA；禁用云同步/AI/MCP/更新) | [SinaXhpm/Submarine](https://github.com/SinaXhpm/Submarine) | [`build-submarine.yml`](.github/workflows/build-submarine.yml) | ![Submarine Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-submarine.yml/badge.svg) |
 
 ---
 
@@ -31,6 +34,7 @@
 
 - **错峰定时触发**：工作流每天错峰检测上游版本，避免 GitHub Actions 整点拥堵。
 - **手动触发**：可以在 GitHub Actions 页面选择具体的工作流手动点击 **Run workflow** 触发构建（可传入 `force` 重新编译或指定 `tag`）。
+- **强制安全补丁校验**：包含 `patches/<应用>/*.patch` 安全加固补丁的工作流在编译前会强制执行 `git apply --check`，冲突时直接中止，且绝不改动上游锁文件（严格 `--locked` / `npm ci`）。
 - **干净源码归档**：每个 Release 都包含由固定上游提交通过 `git archive` 生成的 `[应用]-[版本]-source.tar.gz`，不会混入构建结果或构建时修改的文件。
 - **发布完整性**：创建 Release 前会核对精确产物清单、生成 `SHA256SUMS`，并发布 GitHub 构建来源证明。
 - **最小权限**：构建 Job 只有只读权限，外部 Checkout 不持久化凭据，只有最终发布 Job 获得写入与证明权限。

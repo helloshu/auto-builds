@@ -24,6 +24,9 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 | **LibChecker** | Native Kotlin Android app library & architecture inspector (FOSS edition) | [LibChecker/LibChecker](https://github.com/LibChecker/LibChecker) | [`build-libchecker.yml`](.github/workflows/build-libchecker.yml) | ![LibChecker Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-libchecker.yml/badge.svg) |
 | **Round Sync** | Android Rclone cloud storage manager & sync client (OSS edition, 4 ABIs + universal) | [newhinton/Round-Sync](https://github.com/newhinton/Round-Sync) | [`build-round-sync.yml`](.github/workflows/build-round-sync.yml) | ![Round Sync Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-round-sync.yml/badge.svg) |
 | **Shizuku** | Android system API access framework via ADB / root (with bundled `rish` & native starter) | [RikkaApps/Shizuku](https://github.com/RikkaApps/Shizuku) | [`build-shizuku.yml`](.github/workflows/build-shizuku.yml) | ![Shizuku Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shizuku.yml/badge.svg) |
+| **ShellRS** | Hardened Rust / GPUI native SSH client (Linux x64 tar.gz/deb/rpm/AppImage, Windows x64 Inno Setup/portable, macOS arm64 & x64 dmg/app.zip; telemetry & online updater removed) | [since2006/shell-rs](https://github.com/since2006/shell-rs) | [`build-shell-rs.yml`](.github/workflows/build-shell-rs.yml) | ![ShellRS Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shell-rs.yml/badge.svg) |
+| **shellwing** | Hardened Rust / GPUI / Zig native SSH client (Linux x64/arm64, Windows x64, macOS arm64/x64, Android APK, iOS unsigned IPA; updater & security fixes patched) | [hivepaas/shellwing](https://github.com/hivepaas/shellwing) | [`build-shellwing.yml`](.github/workflows/build-shellwing.yml) | ![shellwing Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-shellwing.yml/badge.svg) |
+| **Submarine** | Hardened Rust / Tauri SSH & SFTP client (Linux x64, Windows x64 msi/setup/portable, macOS universal, Android 16 KB aligned APK, iOS unsigned IPA; cloud/AI/MCP/updater disabled) | [SinaXhpm/Submarine](https://github.com/SinaXhpm/Submarine) | [`build-submarine.yml`](.github/workflows/build-submarine.yml) | ![Submarine Build Status](https://github.com/helloshu/auto-builds/actions/workflows/build-submarine.yml/badge.svg) |
 
 ---
 
@@ -31,6 +34,7 @@ An automated workflow hub designed to track upstream open-source releases, trigg
 
 - **Scheduled Triggers**: Workflows use staggered daily schedules to avoid GitHub Actions' top-of-hour congestion.
 - **Manual Triggers**: Manually trigger builds on demand via the GitHub Actions UI with custom options (`force` re-builds or specific tags).
+- **Mandatory Security Patches**: Workflows with local hardening patches under `patches/<app>/*.patch` enforce `git apply --check` before building and abort on conflict without modifying upstream lockfiles (`--locked` / `npm ci`).
 - **Clean Source Archives**: Every Release includes an `[app]-[version]-source.tar.gz` created with `git archive` from the immutable upstream commit, without build outputs or modified files.
 - **Release Integrity**: Workflows validate an exact artifact manifest, generate `SHA256SUMS`, and publish GitHub build-provenance attestations before creating a Release.
 - **Least Privilege**: Build jobs are read-only, external checkouts do not persist credentials, and only the final release job receives write and attestation permissions.

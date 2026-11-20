@@ -1,0 +1,890 @@
+name: shellwing Auto Build & Release
+
+on:
+  schedule:
+    - cron: '27 22 * * *' # 每天北京时间 06:27，避开整点高峰
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: '强制编译指定的上游 Tag 版本 (例: v0.2.1)'
+        required: false
+        default: ''
+      expected_sha:
+        description: '可选：强制校验上游 40 位 Commit SHA'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-build-shellwing
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: ubuntu-24.04
+    outputs:
+      has_new_version: ${{ steps.compare.outputs.has_new_version }}
+      app_id: ${{ steps.compare.outputs.app_id }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      release_tag: ${{ steps.compare.outputs.release_tag }}
+    steps:
+      - name: 获取上游最新正式 Tag 并检查本地 Release
+        id: compare
+        shell: bash
+        env:
+          APP_ID: shellwing
+          UPSTREAM_REPO: hivepaas/shellwing
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_RE='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+
+          if [ -n "$INPUT_TAG" ]; then
+            UPSTREAM_TAG="$INPUT_TAG"
+          else
+            UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=50" \
+              --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name' \
+              | grep -E "$TAG_RE" \
+              | awk '{raw=$0; norm=$0; sub(/^v/, "", norm); print norm "\t" raw}' \
+              | sort -V -k1,1 \
+              | tail -n 1 \
+              | cut -f2 || true)
+            if [ -z "$UPSTREAM_TAG" ]; then
+              UPSTREAM_TAG=$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name' \
+                | grep -E "$TAG_RE" \
+                | awk '{raw=$0; norm=$0; sub(/^v/, "", norm); print norm "\t" raw}' \
+                | sort -V -k1,1 \
+                | tail -n 1 \
+                | cut -f2 || true)
+            fi
+          fi
+
+          UPSTREAM_TAG="${UPSTREAM_TAG#refs/tags/}"
+          if [ -z "$UPSTREAM_TAG" ] || ! git check-ref-format "refs/tags/${UPSTREAM_TAG}"; then
+            echo "::error::无法获取有效的上游标签: ${UPSTREAM_TAG:-<empty>}"
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_TAG" =~ $TAG_RE ]]; then
+            echo "::error::上游标签 ${UPSTREAM_TAG} 不符合正式版格式 (vX.Y.Z)"
+            exit 1
+          fi
+
+          ENCODED_UPSTREAM_TAG=$(jq -rn --arg value "$UPSTREAM_TAG" '$value | @uri')
+          UPSTREAM_SHA=$(gh api "repos/${UPSTREAM_REPO}/commits/${ENCODED_UPSTREAM_TAG}" --jq '.sha')
+          if ! [[ "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::无法把 ${UPSTREAM_TAG} 解析为 40 位固定提交 SHA"
+            exit 1
+          fi
+
+          if [ -n "$EXPECTED_SHA" ]; then
+            if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::expected_sha 必须是 40 位小写十六进制 Commit SHA"
+              exit 1
+            fi
+            if [ "$UPSTREAM_SHA" != "$EXPECTED_SHA" ]; then
+              echo "::error::上游 ${UPSTREAM_TAG} 提交 SHA 不匹配: 预期 ${EXPECTED_SHA}，实际 ${UPSTREAM_SHA}"
+              exit 1
+            fi
+          fi
+
+          RELEASE_TAG="${APP_ID}-${UPSTREAM_TAG}"
+          {
+            echo "app_id=$APP_ID"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$INPUT_TAG" ]; then
+            echo "has_new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENCODED_RELEASE_TAG=$(jq -rn --arg value "$RELEASE_TAG" '$value | @uri')
+          STATUS=$(curl -sS --retry 2 --retry-delay 5 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_RELEASE_TAG}")
+          case "$STATUS" in
+            200) echo "has_new_version=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "has_new_version=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::检查 ${RELEASE_TAG} 时 GitHub API 返回 HTTP ${STATUS}"
+              exit 1
+              ;;
+          esac
+
+  validate-android-signing:
+    name: Validate Android release signing secrets
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a persistent Android signing identity
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::缺少必需的 Android 签名 Secret: $name"
+              exit 1
+            fi
+          done
+
+  archive-source:
+    name: Archive clean upstream source
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hivepaas/shellwing
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Create source archive from tracked files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          SRC_NAME="shellwing-${VERSION}-source"
+          mkdir -p source-assets
+          git -C app-src archive --format=tar --prefix="${SRC_NAME}/" HEAD \
+            | gzip -n -9 > "source-assets/${SRC_NAME}.tar.gz"
+          test -s "source-assets/${SRC_NAME}.tar.gz"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-shellwing
+          path: source-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  build-desktop:
+    name: Build Desktop ${{ matrix.label }}
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-22.04
+            os: linux
+            arch: x86_64
+            zig_archive: zig-x86_64-linux-0.17.0.tar.xz
+            zig_sha: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+          - label: linux-aarch64
+            runner: ubuntu-22.04-arm
+            os: linux
+            arch: aarch64
+            zig_archive: zig-aarch64-linux-0.17.0.tar.xz
+            zig_sha: 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+          - label: macos-aarch64
+            runner: macos-15
+            os: macos
+            arch: aarch64
+            zig_archive: zig-aarch64-macos-0.17.0.tar.xz
+            zig_sha: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+          - label: macos-x86_64
+            runner: macos-15-intel
+            os: macos
+            arch: x86_64
+            zig_archive: zig-x86_64-macos-0.17.0.tar.xz
+            zig_sha: 4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6
+          - label: windows-x86_64
+            runner: windows-2025
+            os: windows
+            arch: x86_64
+            zig_archive: zig-x86_64-windows-0.17.0.zip
+            zig_sha: b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hivepaas/shellwing
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shellwing/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shellwing 安全补丁 (patches/shellwing/*.patch)"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+          VERSION="${UPSTREAM_TAG#v}"
+          CARGO_VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' app-src/Cargo.toml)
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::Cargo.toml 版本 (${CARGO_VERSION}) 与上游标签 (${VERSION}) 不一致"
+            exit 1
+          fi
+
+      - name: Install Linux build and packaging dependencies
+        if: matrix.os == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-xkb-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libvulkan-dev libdbus-1-dev libzstd-dev libpam0g-dev dpkg-dev rpm file
+
+      - name: Install Zig 0.17.0 with hardcoded SHA-256 verification (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        env:
+          ZIG_ARCHIVE: ${{ matrix.zig_archive }}
+          ZIG_SHA: ${{ matrix.zig_sha }}
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.17.0/${ZIG_ARCHIVE}"
+          OUT="$RUNNER_TEMP/${ZIG_ARCHIVE}"
+          DEST="$RUNNER_TEMP/zig"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$OUT" "$URL"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${ZIG_SHA}  ${OUT}" | sha256sum -c -
+          else
+            echo "${ZIG_SHA}  ${OUT}" | shasum -a 256 -c -
+          fi
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          tar -xf "$OUT" -C "$DEST" --strip-components=1
+          "$DEST/zig" version
+          echo "$DEST" >> "$GITHUB_PATH"
+
+      - name: Install Zig 0.17.0 and NSIS 3.13 with hardcoded SHA-256 verification (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          ZIG_ARCHIVE: ${{ matrix.zig_archive }}
+          ZIG_SHA: ${{ matrix.zig_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1. Zig 0.17.0
+          $zigUrl = "https://ziglang.org/download/0.17.0/$env:ZIG_ARCHIVE"
+          $zigZip = Join-Path $env:RUNNER_TEMP $env:ZIG_ARCHIVE
+          $zigDest = Join-Path $env:RUNNER_TEMP 'zig-extract'
+          Invoke-WebRequest -Uri $zigUrl -OutFile $zigZip
+          $zigActual = (Get-FileHash -Path $zigZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($zigActual -ne $env:ZIG_SHA) {
+            throw "Zig SHA-256 mismatch: expected $env:ZIG_SHA, got $zigActual"
+          }
+          Expand-Archive -Path $zigZip -DestinationPath $zigDest -Force
+          $zigDir = (Get-ChildItem -Path $zigDest -Directory | Select-Object -First 1).FullName
+          & (Join-Path $zigDir 'zig.exe') version
+          $zigDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          # 2. NSIS 3.13 (no choco install)
+          $nsisUrl = 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip'
+          $nsisSha = 'ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8'
+          $nsisZip = Join-Path $env:RUNNER_TEMP 'nsis-3.13.zip'
+          $nsisDest = Join-Path $env:RUNNER_TEMP 'nsis'
+          Invoke-WebRequest -Uri $nsisUrl -OutFile $nsisZip
+          $nsisActual = (Get-FileHash -Path $nsisZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($nsisActual -ne $nsisSha) {
+            throw "NSIS 3.13 SHA-256 mismatch: expected $nsisSha, got $nsisActual"
+          }
+          Expand-Archive -Path $nsisZip -DestinationPath $nsisDest -Force
+          $makensis = (Get-ChildItem -Path $nsisDest -Recurse -Filter 'makensis.exe' | Select-Object -First 1).FullName
+          if (-not $makensis) { throw "makensis.exe not found under $nsisDest" }
+          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install pinned Rust toolchain from upstream rust-toolchain.toml
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Fetch pinned ghostty source (up to 3 tries)
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ghostty-src"
+          if command -v cygpath >/dev/null 2>&1; then dir=$(cygpath -m "$dir"); fi
+          for try in 1 2 3; do
+            manifest=$(cargo metadata --format-version 1 --locked |
+              jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
+              if command -v cygpath >/dev/null 2>&1; then manifest=$(cygpath -u "$manifest"); fi &&
+              commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
+              test -n "$commit" &&
+              rm -rf "$dir" &&
+              git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
+                https://github.com/ghostty-org/ghostty.git "$dir" &&
+              git -C "$dir" checkout --quiet "$commit" &&
+              { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
+            echo "::warning::fetching ghostty failed (try $try)"
+            sleep 30
+          done
+          exit 1
+
+      - name: Build libghostty-vt-sys (up to 3 tries) and hardened shellwing
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          EMPTY_KEYS="$RUNNER_TEMP/empty-release-keys"
+          rm -rf "$EMPTY_KEYS" && mkdir -p "$EMPTY_KEYS"
+          export SHELLWING_RELEASE_KEYS="$EMPTY_KEYS"
+
+          for try in 1 2 3; do
+            cargo build --release --locked -p libghostty-vt-sys && break
+            [ "$try" = 3 ] && exit 1
+            echo "::warning::libghostty-vt-sys build failed (try $try), retrying"
+            sleep 30
+          done
+
+          cargo build --release --locked -p shellwing
+          git diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Package desktop installers and portable bundles
+        working-directory: ./app-src
+        shell: bash
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          rm -rf dist ../release-assets
+          mkdir -p ../release-assets
+
+          case "$TARGET_OS" in
+            linux)
+              ARCH="$TARGET_ARCH" DIST=dist scripts/package_linux.sh
+              ;;
+            macos)
+              scripts/check_macos_minimum.sh release
+              unset MACOS_SIGN_IDENTITY
+              ARCH="$TARGET_ARCH" DIST=dist scripts/package_macos.sh
+              ;;
+            windows)
+              MAKENSIS_POSIX=$(cygpath -u "$MAKENSIS")
+              MAKENSIS="$MAKENSIS_POSIX" ARCH="$TARGET_ARCH" DIST=dist scripts/package_windows.sh
+              ;;
+          esac
+
+          cp dist/* ../release-assets/
+          ls -la ../release-assets
+
+      - name: Upload desktop release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shellwing-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-android:
+    name: Build Android Unsigned APK (arm64 + x86_64)
+    needs: [check-version, validate-android-signing]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hivepaas/shellwing
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shellwing/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shellwing 安全补丁"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Install Zig 0.17.0 with hardcoded SHA-256 verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz"
+          SHA="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+          OUT="$RUNNER_TEMP/zig-x86_64-linux-0.17.0.tar.xz"
+          DEST="$RUNNER_TEMP/zig"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$OUT" "$URL"
+          echo "${SHA}  ${OUT}" | sha256sum -c -
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          tar -xf "$OUT" -C "$DEST" --strip-components=1
+          "$DEST/zig" version
+          echo "$DEST" >> "$GITHUB_PATH"
+
+      - name: Setup Java 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK (API 37 + NDK)
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: 'platforms;android-37 build-tools;37.0.0'
+
+      - name: Install pinned Rust toolchain, Android targets, and cargo-ndk
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add aarch64-linux-android x86_64-linux-android
+          cargo install cargo-ndk --locked --version 4.1.2
+
+      - name: Fetch pinned ghostty source (up to 3 tries)
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ghostty-src"
+          for try in 1 2 3; do
+            manifest=$(cargo metadata --format-version 1 --locked |
+              jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
+              commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
+              test -n "$commit" &&
+              rm -rf "$dir" &&
+              git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
+                https://github.com/ghostty-org/ghostty.git "$dir" &&
+              git -C "$dir" checkout --quiet "$commit" &&
+              { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
+            echo "::warning::fetching ghostty failed (try $try)"
+            sleep 30
+          done
+          exit 1
+
+      - name: Build Android native libraries and unsigned release APK (no secrets)
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EMPTY_KEYS="$RUNNER_TEMP/empty-release-keys"
+          rm -rf "$EMPTY_KEYS" && mkdir -p "$EMPTY_KEYS"
+          export SHELLWING_RELEASE_KEYS="$EMPTY_KEYS"
+          unset SHELLWING_KEYSTORE SHELLWING_KEYSTORE_PASSWORD SHELLWING_KEY_ALIAS SHELLWING_KEY_PASSWORD
+
+          # Prime ghostty zig dependencies with retries before Android cross-compile
+          for try in 1 2 3; do
+            cargo check --locked -p libghostty-vt-sys && break
+            [ "$try" = 3 ] && exit 1
+            sleep 30
+          done
+
+          scripts/build_android.sh
+          git diff --exit-code Cargo.toml Cargo.lock
+
+          yes | sdkmanager --licenses >/dev/null || true
+          chmod +x android/gradlew
+          (cd android && ./gradlew --no-daemon --no-scan assembleRelease)
+
+          # Must ONLY produce unsigned APK (no keystore mounted in this job)
+          if find android/app/build/outputs/apk/release -type f -name 'app-release.apk' | grep -q .; then
+            echo "::error::构建任务不应产出已签名 APK"
+            exit 1
+          fi
+          APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -s "$APK"
+          mkdir -p ../android-build-input
+          cp "$APK" "../android-build-input/shellwing_${VERSION}_android-unsigned.apk"
+
+      - name: Upload Android signing input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-build-input-shellwing
+          path: android-build-input/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-android:
+    name: Sign Android APK in isolated job
+    needs: [check-version, build-android]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup Java 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android build tools
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: 'build-tools;37.0.0'
+
+      - name: Download Android signing input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-build-input-shellwing
+          path: android-input
+
+      - name: Align, sign, and verify release APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/37.0.0"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+
+          SIGNING_DIR=$(mktemp -d)
+          trap 'rm -rf "$SIGNING_DIR"' EXIT
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$SIGNING_DIR/release.jks"
+          umask 022
+
+          INPUT="android-input/shellwing_${VERSION}_android-unsigned.apk"
+          test -s "$INPUT"
+          if "$ZIPALIGN" -c -P 16 4 "$INPUT" >/dev/null 2>&1; then
+            cp "$INPUT" "$SIGNING_DIR/aligned.apk"
+          else
+            "$ZIPALIGN" -f -P 16 4 "$INPUT" "$SIGNING_DIR/aligned.apk"
+          fi
+
+          mkdir -p release-assets
+          OUTPUT="release-assets/shellwing_${VERSION}_android.apk"
+          "$APKSIGNER" sign \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --v4-signing-enabled false \
+            --ks "$SIGNING_DIR/release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$OUTPUT" \
+            "$SIGNING_DIR/aligned.apk"
+          "$APKSIGNER" verify --verbose --print-certs "$OUTPUT"
+          "$ZIPALIGN" -c -P 16 4 "$OUTPUT"
+          test -s "$OUTPUT"
+
+      - name: Upload signed Android artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shellwing-android
+          path: release-assets/*.apk
+          if-no-files-found: error
+          retention-days: 5
+
+  build-ios:
+    name: Build iOS arm64 Unsigned IPA
+    needs: check-version
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable upstream commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hivepaas/shellwing
+          ref: ${{ needs.check-version.outputs.upstream_sha }}
+          path: app-src
+          persist-credentials: false
+
+      - name: Checkout security patches from auto-builds
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: auto-builds
+          persist-credentials: false
+
+      - name: Verify and apply security hardening patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          PATCHES=(auto-builds/patches/shellwing/*.patch)
+          if [ "${#PATCHES[@]}" -eq 0 ]; then
+            echo "::error::未找到 shellwing 安全补丁"
+            exit 1
+          fi
+          for patch in "${PATCHES[@]}"; do
+            echo "Checking patch: $patch"
+            git -C app-src apply --check "$PWD/$patch"
+            git -C app-src apply "$PWD/$patch"
+          done
+          git -C app-src diff --exit-code Cargo.toml Cargo.lock
+
+      - name: Install Zig 0.17.0 with hardcoded SHA-256 verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz"
+          SHA="b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
+          OUT="$RUNNER_TEMP/zig-aarch64-macos-0.17.0.tar.xz"
+          DEST="$RUNNER_TEMP/zig"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$OUT" "$URL"
+          echo "${SHA}  ${OUT}" | shasum -a 256 -c -
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          tar -xf "$OUT" -C "$DEST" --strip-components=1
+          "$DEST/zig" version
+          echo "$DEST" >> "$GITHUB_PATH"
+
+      - name: Install pinned Rust toolchain and iOS targets
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Fetch pinned ghostty source (up to 3 tries)
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ghostty-src"
+          for try in 1 2 3; do
+            manifest=$(cargo metadata --format-version 1 --locked |
+              jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
+              commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
+              test -n "$commit" &&
+              rm -rf "$dir" &&
+              git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
+                https://github.com/ghostty-org/ghostty.git "$dir" &&
+              git -C "$dir" checkout --quiet "$commit" &&
+              { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
+            echo "::warning::fetching ghostty failed (try $try)"
+            sleep 30
+          done
+          exit 1
+
+      - name: Build iOS XCFramework and unsigned arm64 IPA
+        working-directory: ./app-src
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          BUILD_NUM=$(date -u +%Y%m%d%H%M)
+          EMPTY_KEYS="$RUNNER_TEMP/empty-release-keys"
+          rm -rf "$EMPTY_KEYS" && mkdir -p "$EMPTY_KEYS"
+          export SHELLWING_RELEASE_KEYS="$EMPTY_KEYS"
+
+          for try in 1 2 3; do
+            cargo check --locked -p libghostty-vt-sys && break
+            [ "$try" = 3 ] && exit 1
+            sleep 30
+          done
+
+          scripts/build_ios.sh
+          git diff --exit-code Cargo.toml Cargo.lock
+
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          (cd ios && xcodegen generate --spec project.yml)
+
+          OUT_BUILD="$RUNNER_TEMP/ios-build"
+          rm -rf "$OUT_BUILD"
+          xcodebuild \
+            -project ios/Shellwing.xcodeproj \
+            -scheme Shellwing \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            CONFIGURATION_BUILD_DIR="$OUT_BUILD" \
+            build
+
+          test -d "$OUT_BUILD/Shellwing.app"
+          IPA_STAGE="$RUNNER_TEMP/ipa-stage"
+          rm -rf "$IPA_STAGE" && mkdir -p "$IPA_STAGE/Payload" ../release-assets
+          cp -R "$OUT_BUILD/Shellwing.app" "$IPA_STAGE/Payload/"
+          OUT_IPA="$(cd ../release-assets && pwd)/shellwing_${VERSION}_ios_arm64-unsigned.ipa"
+          (cd "$IPA_STAGE" && zip -qry "$OUT_IPA" Payload)
+          test -s "$OUT_IPA"
+          ls -la ../release-assets
+
+      - name: Upload iOS unsigned IPA artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-shellwing-ios
+          path: release-assets/*.ipa
+          if-no-files-found: error
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, archive-source, build-desktop, sign-android, build-ios]
+    if: needs.check-version.outputs.has_new_version == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Download source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          pattern: source-*
+          merge-multiple: true
+
+      - name: Verify complete artifact manifest
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${UPSTREAM_TAG#v}"
+          EXPECTED=(
+            "shellwing-${VERSION}-source.tar.gz"
+            "shellwing_${VERSION}_linux_x86_64.tar.gz"
+            "shellwing_${VERSION}_linux_x86_64.AppImage"
+            "shellwing_${VERSION}_amd64.deb"
+            "shellwing_${VERSION}_x86_64.rpm"
+            "shellwing_${VERSION}_linux_aarch64.tar.gz"
+            "shellwing_${VERSION}_linux_aarch64.AppImage"
+            "shellwing_${VERSION}_arm64.deb"
+            "shellwing_${VERSION}_aarch64.rpm"
+            "shellwing_${VERSION}_windows_x86_64-setup.exe"
+            "shellwing_${VERSION}_windows_x86_64.zip"
+            "shellwing_${VERSION}_macos_aarch64.dmg"
+            "shellwing_${VERSION}_macos_aarch64.app.tar.gz"
+            "shellwing_${VERSION}_macos_x86_64.dmg"
+            "shellwing_${VERSION}_macos_x86_64.app.tar.gz"
+            "shellwing_${VERSION}_android.apk"
+            "shellwing_${VERSION}_ios_arm64-unsigned.ipa"
+          )
+
+          for name in "${EXPECTED[@]}"; do
+            COUNT=$(find artifacts -type f -name "$name" | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "::error::产物 $name 的数量应为 1，实际为 $COUNT"
+              exit 1
+            fi
+          done
+
+          ACTUAL_COUNT=$(find artifacts -type f | wc -l)
+          if [ "$ACTUAL_COUNT" -ne "${#EXPECTED[@]}" ]; then
+            echo "::error::发现未列入清单的产物；预期 ${#EXPECTED[@]} 个，实际 $ACTUAL_COUNT 个"
+            find artifacts -type f -print
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM_FILE=$(mktemp)
+          cd artifacts
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > "$CHECKSUM_FILE"
+          mv "$CHECKSUM_FILE" SHA256SUMS
+          test -s SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: artifacts/**/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: shellwing ${{ needs.check-version.outputs.upstream_tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Automated hardened build of [hivepaas/shellwing ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/hivepaas/shellwing/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
+
+            Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
+            Hardening applied from `patches/shellwing/` (online updater & external note image fetch disabled, SFTP path traversal fixed, `ProxyCommand`/`Match exec` token injection blocked, `AuthMethod::Agent`/`Password` isolation & `ForwardAgent` override fixed, Unix `0700/0600` permissions, HTTPS-only sync, bounded Argon2 KDF parameters, Gradle wrapper SHA-256 pinned).
+            Android APK is signed in an isolated job with this repository's persistent Android release certificate; iOS IPA is unsigned for self-signing/sideloading.
+            SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
