@@ -405,7 +405,13 @@ jobs:
             macos)
               scripts/check_macos_minimum.sh release
               unset MACOS_SIGN_IDENTITY
-              ARCH="$TARGET_ARCH" DIST=dist scripts/package_macos.sh
+              for attempt in 1 2 3 4 5; do
+                rm -rf dist
+                ARCH="$TARGET_ARCH" DIST=dist scripts/package_macos.sh && break
+                [ "$attempt" = 5 ] && exit 1
+                echo "::warning::package_macos.sh failed (attempt $attempt), retrying after hdiutil settle"
+                sleep 10
+              done
               ;;
             windows)
               MAKENSIS_POSIX=$(cygpath -u "$MAKENSIS")
@@ -487,7 +493,7 @@ jobs:
       - name: Setup Android SDK (API 37 + NDK)
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         with:
-          packages: 'platforms;android-37 build-tools;37.0.0'
+          packages: 'platforms;android-37.0 build-tools;37.0.0'
 
       - name: Install pinned Rust toolchain, Android targets, and cargo-ndk
         working-directory: ./app-src
@@ -874,7 +880,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.release_tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ github.ref_name }}
           name: shellwing ${{ needs.check-version.outputs.upstream_tag }}
           draft: false
           prerelease: false
