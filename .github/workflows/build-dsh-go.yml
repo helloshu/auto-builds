@@ -403,8 +403,14 @@ jobs:
             chmod +x gradlew
           )
 
+          BUILD_APK_ARGS=(-f all --build-name "$VERSION" --keep-daemon)
+          # Upstream v1.3.0+ requires a licensed companion pack (untracked in git) for release builds unless --no-companion is passed.
+          if grep -q -- '--no-companion' tooling/build-apk.sh; then
+            BUILD_APK_ARGS+=(--no-companion)
+          fi
+
           for attempt in 1 2 3; do
-            if DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh -f all --build-name "$VERSION" --keep-daemon; then
+            if DSH_BETA_TOKEN_FILE= bash tooling/build-apk.sh "${BUILD_APK_ARGS[@]}"; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
