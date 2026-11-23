@@ -539,6 +539,7 @@ jobs:
             sleep 30
           done
 
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
           scripts/build_android.sh
           git diff --exit-code Cargo.toml Cargo.lock
 

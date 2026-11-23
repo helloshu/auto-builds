@@ -38,10 +38,10 @@ index c5f9a53..df3acc5 100644
  zipStorePath=wrapper/dists
  zipStoreBase=GRADLE_USER_HOME
 diff --git a/src-tauri/src/about.rs b/src-tauri/src/about.rs
-index a86250a..62f25b9 100644
+index 27b8f6e..c08d731 100644
 --- a/src-tauri/src/about.rs
 +++ b/src-tauri/src/about.rs
-@@ -41,9 +41,8 @@ pub fn app_info() -> AppInfo {
+@@ -52,9 +52,8 @@ pub fn app_info() -> AppInfo {
      }
  }
  
@@ -53,7 +53,7 @@ index a86250a..62f25b9 100644
  fn updates() -> bool {
      UPDATES && !in_flatpak()
  }
-@@ -56,18 +55,14 @@ pub struct UpdateInfo {
+@@ -67,18 +66,14 @@ pub struct UpdateInfo {
      /// `None` if the API call failed or no release exists.
      pub latest: Option<String>,
      /// True when the highest published, non-prerelease release on GitHub is a
@@ -75,7 +75,7 @@ index a86250a..62f25b9 100644
  #[derive(Debug, serde::Deserialize)]
  struct GhRelease {
      #[serde(default)]
-@@ -80,90 +75,14 @@ struct GhRelease {
+@@ -91,99 +86,20 @@ struct GhRelease {
      prerelease: bool,
  }
  
@@ -85,13 +85,16 @@ index a86250a..62f25b9 100644
 -/// flag is date-based (and manually overridable), so a hotfix published on an
 -/// old line could point it at a lower version than what's actually shipped.
 -/// Instead we scan every published, non-prerelease release and pick the highest
--/// SEMVER ourselves, then compare that to `current`. Anonymous calls are rate-
+-/// SEMVER ourselves, then compare that to `current`. With `include_beta` (the
+-/// "Tell me about beta versions" setting) pre-releases count too. Anonymous calls are rate-
 -/// limited to ~60/hour per IP — fine for an occasional check. The timeout is
 -/// short so a hung connection can't leave the check spinning.
 +/// Update checks are disabled in hardened builds; never contacts GitHub.
++#[allow(unused_variables)]
  #[tauri::command]
- pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-     let current = env!("CARGO_PKG_VERSION").to_string();
+ pub async fn check_for_updates(include_beta: Option<bool>) -> Result<UpdateInfo, String> {
+     let current = running_version().to_string();
+-    let include_beta = include_beta.unwrap_or(false);
 -    // The App Store's builds and a Flatpak: nothing is asked, nothing is offered.
 -    if !updates() {
 -        return Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None });
@@ -129,11 +132,12 @@ index a86250a..62f25b9 100644
 -    let bytes = crate::cloud::read_capped(resp, 8 * 1024 * 1024).await.map_err(|e| format!("[UPDATE] {}", e))?;
 -    let releases: Vec<GhRelease> = serde_json::from_slice(&bytes).map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 -
--    // Highest published, non-prerelease semver wins. Drafts are only visible
--    // with auth (we're anonymous) but we skip them defensively all the same.
+-    // Highest published semver wins, pre-releases only with include_beta.
+-    // Drafts are only visible with auth (we're anonymous) but we skip them
+-    // defensively all the same.
 -    let mut best: Option<(String, String)> = None; // (clean_version, html_url)
 -    for r in releases {
--        if r.draft || r.prerelease || r.tag_name.is_empty() {
+-        if r.draft || (r.prerelease && !include_beta) || r.tag_name.is_empty() {
 -            continue;
 -        }
 -        let clean = r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string();
@@ -161,14 +165,21 @@ index a86250a..62f25b9 100644
 +    Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None })
  }
  
--/// True when `a > b` under dotted-number compare (ignores any non-numeric
--/// suffix like "-beta"). Robust enough for our semver-tagged releases:
--/// "0.2.0" > "0.1.5", "1.0.0" > "0.9.9". A pre-release suffix on `a`
--/// makes it sort EQUAL to the same base — preferring stable over pre.
+-/// True when version `a` is newer than `b`, by semver's order: the numbers
+-/// part by part, then a release above its own pre-releases (0.5.0 above
+-/// 0.5.0-beta.6), and pre-release parts as numbers when both are (beta.10
+-/// above beta.9). Build metadata (+...) doesn't count. Comparing the numbers
+-/// only, as before, made 0.5.0 and 0.5.0-beta.6 equal: someone on a beta was
+-/// never told about its release.
 +#[allow(dead_code)]
  fn semver_greater(a: &str, b: &str) -> bool {
-     let strip = |s: &str| s.split(['-', '+']).next().unwrap_or(s).to_string();
-     let parse = |s: String| -> Vec<u64> {
+     semver_cmp(a, b) == std::cmp::Ordering::Greater
+ }
+ 
++#[allow(dead_code)]
+ fn semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+     use std::cmp::Ordering::{Equal, Greater, Less};
+     let split = |s: &str| -> (Vec<u64>, Option<Vec<String>>) {
 diff --git a/src-tauri/src/ai/mod.rs b/src-tauri/src/ai/mod.rs
 index db051e1..e8e8cf8 100644
 --- a/src-tauri/src/ai/mod.rs
@@ -1345,10 +1356,10 @@ index 927b7e1..cb01dff 100644
  
  #[cfg(test)]
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index dea2c27..cc94a13 100644
+index f36529a..da0759b 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
-@@ -8151,7 +8151,13 @@ async fn pick_ssh_key_file() -> Result<Option<String>, String> {
+@@ -8248,7 +8248,13 @@ async fn pick_ssh_key_file() -> Result<Option<String>, String> {
  /// flow. Nothing is written to the vault — the user still reviews the name and
  /// supplies a passphrase before saving.
  #[tauri::command]
@@ -1363,7 +1374,7 @@ index dea2c27..cc94a13 100644
      // Off the main thread (where a sync command runs) and off the async
      // workers: a slow or stuck file read mustn't freeze the window.
      tokio::task::spawn_blocking(move || load_key_from_disk(&expand_home(&path)))
-@@ -21458,14 +21464,43 @@ async fn download_dir_file(
+@@ -21973,14 +21979,43 @@ async fn download_dir_file(
      if !rel_is_plain || !dest.starts_with(&local_root) {
          return Err(DirFileEnd::Failed(format!("unsafe path escaped destination: {}", dest.display())));
      }
@@ -1412,7 +1423,7 @@ index dea2c27..cc94a13 100644
          .map_err(|e| DirFileEnd::Failed(format!("create {}: {}", dest.display(), e)))?;
      let mut buf = vec![0u8; 256 * 1024];
      let copied: Result<(), DirFileEnd> = async {
-@@ -24324,8 +24359,10 @@ fn parse_filezilla_sites(text: &str) -> Result<Vec<ImportedHost>, String> {
+@@ -24874,8 +24909,10 @@ fn parse_filezilla_sites(text: &str) -> Result<Vec<ImportedHost>, String> {
  /// older ~/.filezilla). The page offers it beside ~/.ssh/config. A lab build
  /// with `SUBMARINE_LAB_HOME` reads only below that folder, as for
  /// ~/.ssh/config (ssh_config::home_dir), never the tester's own list.
@@ -1423,7 +1434,7 @@ index dea2c27..cc94a13 100644
      let lab = cfg!(debug_assertions) && std::env::var("SUBMARINE_LAB_HOME").is_ok_and(|h| !h.is_empty());
      let mut places: Vec<std::path::PathBuf> = Vec::new();
      #[cfg(windows)]
-@@ -26244,9 +26281,9 @@ pub fn run() {
+@@ -26811,9 +26848,9 @@ pub fn run() {
              keep_app_data_out_of_backups(app.handle());
              let cloud_state = cloud::CloudState::new(&app.handle());
              app.manage(cloud_state);
@@ -1437,7 +1448,7 @@ index dea2c27..cc94a13 100644
              std::thread::spawn(rdp::clear_old_files);
              // The keep-alive service, while a connection is open.
 diff --git a/src-tauri/src/mirror.rs b/src-tauri/src/mirror.rs
-index 3d30f1e..96409a4 100644
+index 275b677..da1b361 100644
 --- a/src-tauri/src/mirror.rs
 +++ b/src-tauri/src/mirror.rs
 @@ -419,29 +419,56 @@ async fn sftp_download_file(
@@ -1552,7 +1563,7 @@ index 3d30f1e..96409a4 100644
          let size = attr.size.unwrap_or(0);
          out.push(DryRunEntry { path: rel.clone(), size, action: "download-new".into() });
          *total = total.saturating_add(size);
-@@ -1652,7 +1683,7 @@ async fn run_mirror(
+@@ -1666,7 +1697,7 @@ async fn run_mirror(
                  };
                  let res = if is_download {
                      let mt = sftp_remote_mtime(&*sftp, &remote_path).await;
@@ -1561,7 +1572,7 @@ index 3d30f1e..96409a4 100644
                  } else {
                      sftp_upload_file(&*sftp, &local_path, &remote_path).await
                  };
-@@ -2829,8 +2860,27 @@ mod tests {
+@@ -2843,8 +2874,27 @@ mod tests {
          let lab = Lab::new(&[("/srv", Dir), ("/srv/x.desktop", File)], &[], &[]).await;
          let root = std::env::temp_dir().join(format!("sub-mirror-policy-{}", std::process::id()));
          let local = root.join(".config").join("autostart").join("x.desktop");
@@ -1604,10 +1615,10 @@ index c63ef6a..3b3deb8 100644
  /// The device's "Use settings from ~/.ssh/config" switch.
  pub(crate) fn set_enabled(on: bool) {
 diff --git a/src/components/ProfileSelectPage.tsx b/src/components/ProfileSelectPage.tsx
-index 37afc53..ef1bc3e 100644
+index 8fb0893..71547a9 100644
 --- a/src/components/ProfileSelectPage.tsx
 +++ b/src/components/ProfileSelectPage.tsx
-@@ -3,14 +3,13 @@ import { createPortal } from "react-dom";
+@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
  import { invoke } from "@tauri-apps/api/core";
  import {
    AlertTriangle, ArrowBigUp, ArrowRight, ArrowUpCircle, Check, CheckCircle2, Cloud, CloudOff, Download,
@@ -1616,31 +1627,49 @@ index 37afc53..ef1bc3e 100644
  } from "lucide-react";
  import CloudPanel from "./CloudPanel";
  import { CloudConfigView, hostOf } from "./SyncServerSetting";
- import logoUrl from "../assets/logo.png";
+@@ -11,7 +11,6 @@ import logoUrl from "../assets/logo-ui.png";
  import { IS_ANDROID, IS_IOS, IS_MOBILE } from "../util/platform";
  import { PRIVACY_URL } from "../util/links";
+ import { readUpdateBeta } from "../util/updateChannel";
 -import { openFeedback } from "./Feedback";
  import { useTextPrompt, useConfirm } from "../ui/confirm";
  import { forgetProfileBookmarks } from "../util/sftpBookmarks";
  import { t, tn, tx, useT } from "../i18n";
-@@ -290,16 +289,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
+@@ -56,15 +55,6 @@ interface UpdateInfo { current: string; latest: string | null; has_update: boole
+ // answer is for one beta setting (Settings → Updates): with the other one the
+ // next visit asks again.
+ let keptUpdateCheck: { includeBeta: boolean; answer: Promise<UpdateInfo | null> } | null = null;
+-function silentUpdateCheck(includeBeta: boolean): Promise<UpdateInfo | null> {
+-  if (keptUpdateCheck && keptUpdateCheck.includeBeta === includeBeta) return keptUpdateCheck.answer;
+-  const answer: Promise<UpdateInfo | null> = invoke<UpdateInfo>("check_for_updates", { includeBeta }).catch(() => {
+-    if (keptUpdateCheck?.answer === answer) keptUpdateCheck = null;
+-    return null;
+-  });
+-  keptUpdateCheck = { includeBeta, answer };
+-  return answer;
+-}
+ const keepUpdateCheck = (includeBeta: boolean, u: UpdateInfo) => { keptUpdateCheck = { includeBeta, answer: Promise.resolve(u) }; };
+ 
+ // The running version and the project's GitHub page (backend: about::app_info).
+@@ -311,17 +301,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
  
    useEffect(() => { refreshCloud(); }, [refreshCloud]);
  
--  // Check GitHub for a newer release once per app open (this page mounts on
--  // launch and on every return to the picker). Best-effort and silent: the
--  // fetch+semver-compare happens in Rust (about::check_for_updates), and any
--  // failure — offline, rate-limited, no releases — simply shows nothing.
+-  // Check GitHub for a newer release (this page mounts on launch and on every
+-  // return to the picker; silentUpdateCheck asks once while the app runs).
+-  // Best-effort and silent: the fetch+semver-compare happens in Rust
+-  // (about::check_for_updates), and any failure — offline, rate-limited, no
+-  // releases — simply shows nothing.
 -  useEffect(() => {
--    invoke<UpdateInfo>("check_for_updates")
--      .then((u) => { if (u.has_update && u.latest) setUpdate(u); })
--      .catch(() => {});
+-    let mounted = true;
+-    void silentUpdateCheck(readUpdateBeta()).then((u) => { if (mounted && u?.has_update && u.latest) setUpdate(u); });
+-    return () => { mounted = false; };
 -  }, []);
 -
    // A link that can't be opened (no browser / URL handler on this device)
    // says so under the footer row instead of doing nothing.
    const [linkError, setLinkError] = useState("");
-@@ -1116,8 +1105,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
+@@ -1140,8 +1119,6 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
              <FooterButton onClick={openRepo} title={t("Open Submarine on GitHub")} icon={<Github size={12} />} label="GitHub" />
              <FooterDot />
              <FooterButton onClick={() => openLink(PRIVACY_URL)} title={t("What Submarine stores and sends: the privacy policy")} icon={<ShieldCheck size={12} />} label={t("Privacy")} />
