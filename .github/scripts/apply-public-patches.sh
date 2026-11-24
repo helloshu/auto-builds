@@ -43,14 +43,44 @@ for base_patch in "${BASE_PATCHES[@]}"; do
   seen="${seen}${base_patch}|"
 
   if [ -d "${PATCH_DIR}/versions" ]; then
-    while IFS= read -r ver_dir; do
-      [ -n "${ver_dir}" ] || continue
-      alt_cand="${PATCH_DIR}/versions/${ver_dir}/${patch_name}"
-      if [ -f "${alt_cand}" ] && [[ "${seen}" != *"|${alt_cand}|"* ]]; then
+    PY_BIN="python3"
+    command -v "${PY_BIN}" >/dev/null 2>&1 || PY_BIN="python"
+    while IFS= read -r alt_cand; do
+      [ -n "${alt_cand}" ] || continue
+      if [[ "${seen}" != *"|${alt_cand}|"* ]]; then
         candidates+=("${alt_cand}")
         seen="${seen}${alt_cand}|"
       fi
-    done < <(find "${PATCH_DIR}/versions" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort -V -r)
+    done < <("${PY_BIN}" - "${PATCH_DIR}/versions" "${patch_name}" "${UPSTREAM_TAG}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+ver_root = Path(sys.argv[1])
+patch_name = sys.argv[2]
+target_tag = sys.argv[3].strip()
+
+def semver_key(tag: str):
+    clean = tag.strip().removeprefix("v")
+    base, _, pre = clean.partition("-")
+    nums = tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[^0-9]+", base) if x != "")
+    pre_rank = 1 if not pre else 0
+    pre_parts = tuple((0, int(p)) if p.isdigit() else (1, p) for p in pre.split(".")) if pre else ()
+    return (nums, pre_rank, pre_parts, tag)
+
+items = []
+for d in ver_root.iterdir():
+    cand = d / patch_name
+    if d.is_dir() and cand.is_file():
+        items.append((semver_key(d.name), cand.as_posix()))
+
+tkey = semver_key(target_tag)
+le = sorted([x for x in items if x[0][0] <= tkey[0]], key=lambda x: x[0], reverse=True)
+gt = sorted([x for x in items if x[0][0] > tkey[0]], key=lambda x: x[0], reverse=True)
+for _, path_str in le + gt:
+    print(path_str)
+PY
+    )
   fi
 
   applied=""
