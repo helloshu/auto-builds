@@ -189,7 +189,7 @@ jobs:
           fi
 
           ks_file="$RUNNER_TEMP/release.jks"
-          printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
+          ( umask 077 && printf '%s' "$SIGN_B64" | base64 -d > "$ks_file" )
           trap 'rm -f "$ks_file"' EXIT
 
           shopt -s nullglob

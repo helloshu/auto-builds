@@ -290,6 +290,9 @@ jobs:
             echo "::warning::yarn install 第 ${attempt} 次尝试失败，10 秒后重试..."
             sleep 10
           done
+          if [ -f scripts/prepare-agents-anywhere-runtime.mjs ]; then
+            node scripts/prepare-agents-anywhere-runtime.mjs
+          fi
 
       - name: Prepare shared release inputs
         shell: bash

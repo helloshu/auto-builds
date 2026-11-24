@@ -239,19 +239,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/submarine/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 Submarine 安全补丁 (patches/submarine/*.patch)"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/submarine app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code src-tauri/Cargo.toml src-tauri/Cargo.lock package-lock.json
 
       - name: Setup Node 20 (no cache)
@@ -282,6 +275,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${UPSTREAM_TAG#v}"
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib a_mirror_does_not_escape_root_through_local_symlink
           # Stamp tauri.conf.json only (never touch Cargo.toml so --locked holds)
           STAMP_VERSION="$VERSION" node -e '
             const fs = require("fs");
@@ -378,19 +372,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/submarine/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 Submarine 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/submarine app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code src-tauri/Cargo.toml src-tauri/Cargo.lock package-lock.json
 
       - name: Setup Node 20 (no cache)
@@ -585,19 +572,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/submarine/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 Submarine 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/submarine app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code src-tauri/Cargo.toml src-tauri/Cargo.lock package-lock.json
 
       - name: Setup Node 20 (no cache)
@@ -689,19 +669,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/submarine/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 Submarine 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/submarine app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code src-tauri/Cargo.toml src-tauri/Cargo.lock package-lock.json
 
       - name: Setup Node 20 (no cache)
@@ -716,7 +689,7 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK and NDK r28
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         with:
           packages: "platforms;android-36 build-tools;36.0.0 ndk;${{ env.NDK_VERSION }}"
 
@@ -890,19 +863,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/submarine/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 Submarine 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/submarine app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code src-tauri/Cargo.toml src-tauri/Cargo.lock package-lock.json
 
       - name: Select newest Xcode (prefer Xcode 26)
@@ -1065,7 +1031,7 @@ jobs:
             Automated hardened build of [SinaXhpm/Submarine ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/SinaXhpm/Submarine/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
 
             Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
-            Hardening applied from `patches/submarine/` (startup update check & official feedback disabled, official cloud sync / AI assistant / MCP agent gateway disabled, `~/.ssh/config` defaulted off, `read_ssh_key_file` requires unlocked vault, FileZilla credential import disabled, SFTP/Mirror symlink boundary hardened, Gradle wrapper SHA-256 pinned).
+            Hardening applied from [`patches/submarine/`](https://github.com/${{ github.repository }}/tree/${{ github.sha }}/patches/submarine) (startup update check & official feedback disabled, official cloud sync / AI assistant / MCP agent gateway disabled, `~/.ssh/config` defaulted off, `read_ssh_key_file` requires unlocked vault, FileZilla credential import disabled, SFTP/Mirror symlink boundary hardened, Gradle wrapper SHA-256 pinned).
             Android APK is 16 KB page-aligned and signed in an isolated job with this repository's persistent Android release certificate; iOS IPA is unsigned for self-signing/sideloading.
             SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
           files: artifacts/**/*

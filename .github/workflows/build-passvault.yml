@@ -435,7 +435,7 @@ jobs:
             if [ ! -d "${ANDROID_HOME}/build-tools" ]; then
               bash .github/scripts/install-android-sdk.sh "build-tools;${BUILD_TOOLS}"
             fi
-            printf '%s' "$SIGN_B64" | base64 -d > "$ks_file"
+            ( umask 077 && printf '%s' "$SIGN_B64" | base64 -d > "$ks_file" )
             trap 'rm -f "$ks_file"' EXIT
           fi
 

@@ -529,6 +529,40 @@ def download_asset_text(vault_repo: str, vault_token: str, asset_id: int) -> str
         raise
 
 
+def close_resolved_precheck_issues(
+    vault_repo: str, vault_token: str, target_id: str, release_tag: str
+) -> None:
+    prefix = f"[Precheck] {target_id}:"
+    try:
+        issues = gh_request(
+            "GET",
+            f"https://api.github.com/repos/{vault_repo}/issues?state=open&per_page=50",
+            token=vault_token,
+        )
+        for issue in issues:
+            if "pull_request" in issue:
+                continue
+            title = issue.get("title") or ""
+            if not title.startswith(prefix):
+                continue
+            num = issue["number"]
+            gh_request(
+                "POST",
+                f"https://api.github.com/repos/{vault_repo}/issues/{num}/comments",
+                token=vault_token,
+                data={"body": f"Resolved by finalized release `{release_tag}`."},
+            )
+            gh_request(
+                "PATCH",
+                f"https://api.github.com/repos/{vault_repo}/issues/{num}",
+                token=vault_token,
+                data={"state": "closed"},
+            )
+            print(f"[vault] auto-closed resolved precheck issue #{num}")
+    except Exception as exc:
+        print(f"[vault] warning: unable to close resolved precheck issues: {exc}", file=sys.stderr)
+
+
 def cmd_publish_release(
     resolved_env_str: str, notes_file_str: str, assets_dir_str: str, keep_draft: bool = False
 ) -> None:
@@ -564,6 +598,12 @@ def cmd_publish_release(
     )
     rel_id = rel["id"]
     is_draft = bool(rel.get("draft"))
+    if keep_draft and not is_draft:
+        print(
+            f"[publish] refusing to overwrite already-published release {release_tag} with incomplete build (--keep-draft)",
+            file=sys.stderr,
+        )
+        return
     allow_replace = is_draft or (event_name == "workflow_dispatch")
     existing_assets = {a["name"]: a for a in clean_starter_assets(vault_repo, vault_token, rel)}
 
@@ -658,6 +698,8 @@ def cmd_publish_release(
         print(f"[publish] staged partial assets into draft release {release_tag}")
     else:
         print(f"[publish] finalized private release {release_tag}")
+        if cfg.get("TARGET_ID"):
+            close_resolved_precheck_issues(vault_repo, vault_token, cfg["TARGET_ID"], release_tag)
 
 
 def main() -> None:

@@ -183,19 +183,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shell-rs/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shell-rs 安全补丁 (patches/shell-rs/*.patch)"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shell-rs app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
       - name: Install Linux build and packaging dependencies
@@ -215,6 +208,21 @@ jobs:
           rustup toolchain install
           rustc --version
           cargo --version
+
+      - name: Run security hardening unit tests
+        working-directory: ./app-src
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p shellrs-ssh --lib download_refuses_filepart_symlink_overwrite
+          cargo test --locked -p shellrs-sync --lib a_bucket_is_reached_by_its_host_or_its_path
+          cargo test --locked -p shellrs-sync --lib an_address_is_a_folder_and_paths_stay_in_it
+          cargo test --locked --lib the_region_comes_from_the_app_key
+          cargo test --locked --lib each_channel_has_a_manifest_of_its_own
+          cargo test --locked --lib http_feed_is_disabled_and_never_contacts_a_server
+          cargo test --locked --lib automatic_updates_are_on_unless_the_file_says_otherwise
+          cargo test --locked --lib usage_statistics_are_sent_unless_the_file_says_otherwise
+          cargo test --locked --lib terminal_output_is_kept_unless_turned_off
 
       - name: Build hardened shellrs binary (no telemetry/updater channel)
         working-directory: ./app-src
@@ -377,19 +385,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shell-rs/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shell-rs 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shell-rs app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
       - name: Install pinned Rust toolchain from upstream rust-toolchain.toml
@@ -519,19 +520,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shell-rs/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shell-rs 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shell-rs app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
       - name: Install pinned Rust toolchain and macOS target
@@ -686,7 +680,7 @@ jobs:
             Automated hardened build of [since2006/shell-rs ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/since2006/shell-rs/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
 
             Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
-            Hardening applied from `patches/shell-rs/` (telemetry & online updater removed, SFTP symlink/filepart hardening, HTTPS-only WebDAV/S3 sync, external CLI disabled, `keep_output` defaulted off).
+            Hardening applied from [`patches/shell-rs/`](https://github.com/${{ github.repository }}/tree/${{ github.sha }}/patches/shell-rs) (telemetry & online updater removed, SFTP symlink/filepart hardening, HTTPS-only WebDAV/S3 sync, external CLI disabled, `keep_output` defaulted off).
             SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
           files: artifacts/**/*
         env:

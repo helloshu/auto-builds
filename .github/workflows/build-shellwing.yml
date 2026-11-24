@@ -245,17 +245,8 @@ jobs:
           UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shellwing/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shellwing 安全补丁 (patches/shellwing/*.patch)"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shellwing app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
           VERSION="${UPSTREAM_TAG#v}"
@@ -357,11 +348,12 @@ jobs:
               jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
               if command -v cygpath >/dev/null 2>&1; then manifest=$(cygpath -u "$manifest"); fi &&
               commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
-              test -n "$commit" &&
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]] &&
               rm -rf "$dir" &&
               git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
                 https://github.com/ghostty-org/ghostty.git "$dir" &&
               git -C "$dir" checkout --quiet "$commit" &&
+              [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ] &&
               { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
             echo "::warning::fetching ghostty failed (try $try)"
             sleep 30
@@ -371,6 +363,8 @@ jobs:
       - name: Build libghostty-vt-sys (up to 3 tries) and hardened shellwing
         working-directory: ./app-src
         shell: bash
+        env:
+          MATRIX_LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
           EMPTY_KEYS="$RUNNER_TEMP/empty-release-keys"
@@ -383,6 +377,16 @@ jobs:
             echo "::warning::libghostty-vt-sys build failed (try $try), retrying"
             sleep 30
           done
+
+          if [ "$MATRIX_LABEL" = "linux-x86_64" ]; then
+            cargo test --locked -p shellwing-config --lib write_atomic_sets_private_permissions
+            cargo test --locked -p shellwing-core --lib agent_and_password_methods_are_isolated_and_forward_agent_overrides_ssh_config
+            cargo test --locked -p shellwing-ssh --lib safe_entry_name_rejects_traversal_and_separators
+            cargo test --locked -p shellwing-ssh --lib rejects_shell_metacharacters_in_host_user_and_alias
+            cargo test --locked -p shellwing-remote --lib places_are_named_without_their_secrets
+            cargo test --locked -p shellwing-vault --lib kdf_rejects_unreasonable_argon2_parameters_and_open_sets_private_mode
+            cargo test --locked -p shellwing-update --lib download_is_disabled_in_hardened_builds
+          fi
 
           cargo build --release --locked -p shellwing
           git diff --exit-code Cargo.toml Cargo.lock
@@ -454,19 +458,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shellwing/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shellwing 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shellwing app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
       - name: Install Zig 0.17.0 with hardcoded SHA-256 verification
@@ -514,11 +511,12 @@ jobs:
             manifest=$(cargo metadata --format-version 1 --locked |
               jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
               commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
-              test -n "$commit" &&
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]] &&
               rm -rf "$dir" &&
               git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
                 https://github.com/ghostty-org/ghostty.git "$dir" &&
               git -C "$dir" checkout --quiet "$commit" &&
+              [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ] &&
               { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
             echo "::warning::fetching ghostty failed (try $try)"
             sleep 30
@@ -674,19 +672,12 @@ jobs:
 
       - name: Verify and apply security hardening patches
         shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          PATCHES=(auto-builds/patches/shellwing/*.patch)
-          if [ "${#PATCHES[@]}" -eq 0 ]; then
-            echo "::error::未找到 shellwing 安全补丁"
-            exit 1
-          fi
-          for patch in "${PATCHES[@]}"; do
-            echo "Checking patch: $patch"
-            git -C app-src apply --check "$PWD/$patch"
-            git -C app-src apply "$PWD/$patch"
-          done
+          bash auto-builds/.github/scripts/apply-public-patches.sh \
+            auto-builds/patches/shellwing app-src "$UPSTREAM_TAG"
           git -C app-src diff --exit-code Cargo.toml Cargo.lock
 
       - name: Install Zig 0.17.0 with hardcoded SHA-256 verification
@@ -722,11 +713,12 @@ jobs:
             manifest=$(cargo metadata --format-version 1 --locked |
               jq -r '.packages[] | select(.name == "libghostty-vt-sys") | .manifest_path') &&
               commit=$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p' "${manifest%Cargo.toml}build.rs") &&
-              test -n "$commit" &&
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]] &&
               rm -rf "$dir" &&
               git clone --quiet --config core.longpaths=true --filter=blob:none --no-checkout \
                 https://github.com/ghostty-org/ghostty.git "$dir" &&
               git -C "$dir" checkout --quiet "$commit" &&
+              [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ] &&
               { echo "GHOSTTY_SOURCE_DIR=$dir" >> "$GITHUB_ENV"; exit 0; }
             echo "::warning::fetching ghostty failed (try $try)"
             sleep 30
@@ -889,7 +881,7 @@ jobs:
             Automated hardened build of [hivepaas/shellwing ${{ needs.check-version.outputs.upstream_tag }}](https://github.com/hivepaas/shellwing/releases/tag/${{ needs.check-version.outputs.upstream_tag }}).
 
             Upstream commit: `${{ needs.check-version.outputs.upstream_sha }}`
-            Hardening applied from `patches/shellwing/` (online updater & external note image fetch disabled, SFTP path traversal fixed, `ProxyCommand`/`Match exec` token injection blocked, `AuthMethod::Agent`/`Password` isolation & `ForwardAgent` override fixed, Unix `0700/0600` permissions, HTTPS-only sync, bounded Argon2 KDF parameters, Gradle wrapper SHA-256 pinned).
+            Hardening applied from [`patches/shellwing/`](https://github.com/${{ github.repository }}/tree/${{ github.sha }}/patches/shellwing) (online updater & external note image fetch disabled, SFTP path traversal fixed, `ProxyCommand`/`Match exec` token injection blocked, `AuthMethod::Agent`/`Password` isolation & `ForwardAgent` override fixed, Unix `0700/0600` permissions, HTTPS-only sync, bounded Argon2 KDF parameters, Gradle wrapper SHA-256 pinned).
             Android APK is signed in an isolated job with this repository's persistent Android release certificate; iOS IPA is unsigned for self-signing/sideloading.
             SHA-256 checksums are included in `SHA256SUMS`; GitHub build provenance is attached to the artifacts.
           files: artifacts/**/*
