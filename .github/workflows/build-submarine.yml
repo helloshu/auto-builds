@@ -53,11 +53,19 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             UPSTREAM_TAG="$INPUT_TAG"
           else
-            RELEASES_JSON=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=100")
-            UPSTREAM_TAG=$(RELEASES_JSON="$RELEASES_JSON" python3 - <<'PY'
-          import json, os, re, sys
+            RELEASES_FILE=$(mktemp)
+            trap 'rm -f "$RELEASES_FILE"' EXIT
+            gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+              --jq '.[] | {tag_name, draft, prerelease}' > "$RELEASES_FILE"
+            UPSTREAM_TAG=$(python3 - "$RELEASES_FILE" <<'PY'
+          from pathlib import Path
+          import json, re, sys
 
-          releases = json.loads(os.environ["RELEASES_JSON"])
+          releases = [
+              json.loads(line)
+              for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
           pat = re.compile(r'^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$')
 
           def semver_key(tag: str):
@@ -82,8 +90,8 @@ jobs:
               if not m:
                   continue
               is_pre = bool(r.get("prerelease")) or (m.group(4) is not None)
-              # Track v0.5.* prereleases until v0.5.0+ stable supersedes them by SemVer.
-              if is_pre and not tag.startswith("v0.5."):
+              # Track v0.5.0-* prereleases until v0.5.0+ stable supersedes them by SemVer.
+              if is_pre and not tag.startswith("v0.5.0-"):
                   continue
               key = semver_key(tag)
               if key is not None:
