@@ -172,13 +172,15 @@ def cmd_load_env(env_file_str: str, export_gh: bool) -> None:
         if "\n" in v:
             raise SystemExit(f"ERROR: multiline value in {k}")
         exports_lines.append(f"export {k}={shlex.quote(v)}")
-    (env_path.parent / "exports.sh").write_text("\n".join(exports_lines) + "\n", encoding="utf-8")
+    (env_path.parent / "exports.sh").write_text(
+        "\n".join(exports_lines) + "\n", encoding="utf-8", newline="\n"
+    )
 
     if export_gh:
         gh_env = os.environ.get("GITHUB_ENV")
         if not gh_env:
             raise SystemExit("ERROR: GITHUB_ENV is not set")
-        with open(gh_env, "a", encoding="utf-8") as fh:
+        with open(gh_env, "a", encoding="utf-8", newline="\n") as fh:
             for k, v in sorted(values.items()):
                 fh.write(f"{k}={v}\n")
 

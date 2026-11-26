@@ -45,8 +45,10 @@ for base_patch in "${BASE_PATCHES[@]}"; do
   if [ -d "${PATCH_DIR}/versions" ]; then
     PY_BIN="python3"
     command -v "${PY_BIN}" >/dev/null 2>&1 || PY_BIN="python"
-    while IFS= read -r alt_cand; do
-      [ -n "${alt_cand}" ] || continue
+    while IFS= read -r rel_cand; do
+      rel_cand="${rel_cand%$'\r'}"
+      [ -n "${rel_cand}" ] || continue
+      alt_cand="${PATCH_DIR}/${rel_cand}"
       if [[ "${seen}" != *"|${alt_cand}|"* ]]; then
         candidates+=("${alt_cand}")
         seen="${seen}${alt_cand}|"
@@ -55,6 +57,9 @@ for base_patch in "${BASE_PATCHES[@]}"; do
 from pathlib import Path
 import re
 import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(newline="\n")
 
 ver_root = Path(sys.argv[1])
 patch_name = sys.argv[2]
@@ -72,13 +77,13 @@ items = []
 for d in ver_root.iterdir():
     cand = d / patch_name
     if d.is_dir() and cand.is_file():
-        items.append((semver_key(d.name), cand.as_posix()))
+        items.append((semver_key(d.name), f"versions/{d.name}/{patch_name}"))
 
 tkey = semver_key(target_tag)
 le = sorted([x for x in items if x[0][0] <= tkey[0]], key=lambda x: x[0], reverse=True)
 gt = sorted([x for x in items if x[0][0] > tkey[0]], key=lambda x: x[0], reverse=True)
-for _, path_str in le + gt:
-    print(path_str)
+for _, rel_path in le + gt:
+    sys.stdout.write(f"{rel_path}\n")
 PY
     )
   fi

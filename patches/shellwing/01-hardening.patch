@@ -30,10 +30,10 @@ index d6a5573..8380eb7 100644
              remote: remote.to_string(),
              sent: None,
 diff --git a/crates/app/src/files.rs b/crates/app/src/files.rs
-index 47b938f..83fa06f 100644
+index bbc7645..e5f0898 100644
 --- a/crates/app/src/files.rs
 +++ b/crates/app/src/files.rs
-@@ -270,14 +270,15 @@ pub(crate) fn downloads_dir() -> PathBuf {
+@@ -277,14 +277,15 @@ pub(crate) fn downloads_dir() -> PathBuf {
  
  /// `name` in `dir`, or `name (1).ext`, `name (2).ext`… when taken.
  pub(crate) fn unique(dir: &Path, name: &str, taken: &[&Path]) -> PathBuf {
@@ -53,7 +53,7 @@ index 47b938f..83fa06f 100644
      };
      (1..)
          .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-@@ -748,6 +749,9 @@ impl FilesPanel {
+@@ -808,6 +809,9 @@ impl FilesPanel {
          let Some(e) = self.entries.get(ix).cloned() else {
              return;
          };
@@ -63,7 +63,7 @@ index 47b938f..83fa06f 100644
          let taken: Vec<&Path> = self
              .transfers
              .iter()
-@@ -762,6 +766,9 @@ impl FilesPanel {
+@@ -822,6 +826,9 @@ impl FilesPanel {
          let Some(e) = self.entries.get(ix).cloned() else {
              return;
          };
@@ -73,7 +73,7 @@ index 47b938f..83fa06f 100644
          let picked = cx.prompt_for_new_path(&self.downloads, Some(&e.name));
          cx.spawn(async move |this, cx| {
              if let Ok(Ok(Some(local))) = picked.await {
-@@ -776,6 +783,7 @@ impl FilesPanel {
+@@ -836,6 +843,7 @@ impl FilesPanel {
      /// place and moved there only once whole, so a drop never takes half of
      /// it. Returns its place.
      fn stage(&mut self, name: &str, cx: &mut Context<Self>) -> Option<PathBuf> {
@@ -81,7 +81,7 @@ index 47b938f..83fa06f 100644
          let dir = self.dir.clone()?;
          let root = drag_folder()?;
          clean_drags(&root);
-@@ -803,6 +811,9 @@ impl FilesPanel {
+@@ -863,6 +871,9 @@ impl FilesPanel {
  
      /// Downloads the entry `name` of the folder shown to `local`.
      fn download_to(&mut self, name: &str, local: PathBuf, cx: &mut Context<Self>) {
@@ -166,10 +166,10 @@ index cf9f67e..687c4da 100644
  
  /// What to put in place of `range` of `text` for images `ids`: one line each,
 diff --git a/crates/app/src/settings_view.rs b/crates/app/src/settings_view.rs
-index b766a3f..c5fd9fb 100644
+index c67a907..fb7c311 100644
 --- a/crates/app/src/settings_view.rs
 +++ b/crates/app/src/settings_view.rs
-@@ -327,7 +327,7 @@ impl SyncForm {
+@@ -334,7 +334,7 @@ impl SyncForm {
                  if url.is_empty() || user.is_empty() || password.is_empty() {
                      return Err(tr!("Fill in the address, the user and the password."));
                  }
@@ -178,7 +178,7 @@ index b766a3f..c5fd9fb 100644
                      return Err(tr!("The address starts with https://."));
                  }
                  Ok((SyncPlace::WebDav(WebDavSync { url, user }), Some(password)))
-@@ -351,8 +351,7 @@ impl SyncForm {
+@@ -358,8 +358,7 @@ impl SyncForm {
                          "Fill in the endpoint, the bucket, the access key and its secret."
                      ));
                  }
@@ -189,12 +189,12 @@ index b766a3f..c5fd9fb 100644
                  }
                  Ok((SyncPlace::S3(place), Some(secret)))
 diff --git a/crates/app/src/workspace.rs b/crates/app/src/workspace.rs
-index 2d92460..2feb638 100644
+index fe901a1..9d129c7 100644
 --- a/crates/app/src/workspace.rs
 +++ b/crates/app/src/workspace.rs
-@@ -493,7 +493,7 @@ impl Workspace {
-             }
+@@ -632,7 +632,7 @@ impl Workspace {
          }
+         ws.start_ai(cx);
          ws.share_settings(cx);
 -        ws.start_update_checks(cx);
 +        // ws.start_update_checks(cx);
@@ -202,10 +202,10 @@ index 2d92460..2feb638 100644
          std::thread::spawn(crate::editors::system_name);
          // Edited copies an earlier run left behind: those holding changes
 diff --git a/crates/app/src/workspace/updates.rs b/crates/app/src/workspace/updates.rs
-index c55e6e4..039cc84 100644
+index 7a67782..9f88ef8 100644
 --- a/crates/app/src/workspace/updates.rs
 +++ b/crates/app/src/workspace/updates.rs
-@@ -290,10 +290,7 @@ impl Workspace {
+@@ -262,10 +262,7 @@ impl Workspace {
  
      /// The release offered, unless skipped or already running.
      pub(crate) fn update_offered(&self) -> Option<Version> {
@@ -218,7 +218,7 @@ index c55e6e4..039cc84 100644
  
      /// The offered release: downloaded to install, when this copy can take
 diff --git a/crates/config/src/settings.rs b/crates/config/src/settings.rs
-index 3b3cf1e..35f8231 100644
+index 589ca43..4442816 100644
 --- a/crates/config/src/settings.rs
 +++ b/crates/config/src/settings.rs
 @@ -33,7 +33,7 @@ pub struct Updates {
@@ -231,10 +231,10 @@ index 3b3cf1e..35f8231 100644
  }
  
 diff --git a/crates/config/src/store.rs b/crates/config/src/store.rs
-index eee0080..8559fd9 100644
+index e5a65b1..81fcc93 100644
 --- a/crates/config/src/store.rs
 +++ b/crates/config/src/store.rs
-@@ -695,8 +695,27 @@ const HOSTS_EXAMPLE: &str = "# Hosts for shellwing; `shellwing <name or alias>`
+@@ -725,8 +725,27 @@ const HOSTS_EXAMPLE: &str = "# Hosts for shellwing; `shellwing <name or alias>`
  fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
      let dir = path.parent().unwrap_or(Path::new("."));
      fs::create_dir_all(dir)?;
@@ -262,7 +262,7 @@ index eee0080..8559fd9 100644
      fs::write(&tmp, contents)?;
      fs::rename(&tmp, path).inspect_err(|_| {
          let _ = fs::remove_file(&tmp);
-@@ -1069,4 +1088,17 @@ mod tests {
+@@ -1100,4 +1119,17 @@ mod tests {
              format!("shellwing {}", other.display())
          );
      }
@@ -280,11 +280,67 @@ index eee0080..8559fd9 100644
 +        let _ = fs::remove_dir_all(&dir);
 +    }
  }
+diff --git a/crates/core/src/ai/mod.rs b/crates/core/src/ai/mod.rs
+index 4f7c2eb..5da6150 100644
+--- a/crates/core/src/ai/mod.rs
++++ b/crates/core/src/ai/mod.rs
+@@ -1274,10 +1274,15 @@ impl Hub {
+             hop.connect_timeout.get_or_insert(CONNECT_TIMEOUT);
+         }
+         target.connect_timeout.get_or_insert(CONNECT_TIMEOUT);
++        let use_agent = target.identity_agent != shellwing_ssh::config::IdentityAgent::Off
++            || target
++                .jumps
++                .iter()
++                .any(|j| j.identity_agent != shellwing_ssh::config::IdentityAgent::Off);
+         Options {
+             target,
+             auth: Auth {
+-                agent: true,
++                agent: use_agent,
+                 password: None,
+                 agent_socket: None,
+             },
+diff --git a/crates/core/src/ai/transfers.rs b/crates/core/src/ai/transfers.rs
+index 8d9e331..2391a50 100644
+--- a/crates/core/src/ai/transfers.rs
++++ b/crates/core/src/ai/transfers.rs
+@@ -384,7 +384,8 @@ async fn download(sftp: &Sftp, c: &Checked, progress: &Progress) -> Result<Strin
+     let mut target = c.local.clone();
+     // Into a folder here, as cp puts a file.
+     if !folder && target.is_dir() {
+-        target = target.join(sftp::name_of(&remote));
++        let name = sftp::safe_entry_name(sftp::name_of(&remote)).map_err(e)?;
++        target = target.join(name);
+     }
+     if target.exists() && (folder || c.how == WriteHow::Create) {
+         return Err(format!(
+diff --git a/crates/core/src/run.rs b/crates/core/src/run.rs
+index 8cf9b1e..168074e 100644
+--- a/crates/core/src/run.rs
++++ b/crates/core/src/run.rs
+@@ -522,10 +522,15 @@ impl Fleet {
+                 let _ = req.reply.send(answer.await.ok().flatten());
+             }
+         });
++        let use_agent = target.identity_agent != shellwing_ssh::config::IdentityAgent::Off
++            || target
++                .jumps
++                .iter()
++                .any(|j| j.identity_agent != shellwing_ssh::config::IdentityAgent::Off);
+         Options {
+             target,
+             auth: Auth {
+-                agent: true,
++                agent: use_agent,
+                 password: cfg!(debug_assertions)
+                     .then(|| std::env::var("SHELLWING_PASSWORD").ok())
+                     .flatten(),
 diff --git a/crates/core/src/session.rs b/crates/core/src/session.rs
-index dd9866a..6abbfe3 100644
+index 7f1438f..c918d33 100644
 --- a/crates/core/src/session.rs
 +++ b/crates/core/src/session.rs
-@@ -652,10 +652,15 @@ impl Session {
+@@ -677,10 +677,15 @@ impl Session {
                  });
              }
              let (fwd_term, fwd_held) = (term.clone(), held.clone());
@@ -411,7 +467,7 @@ index dd41f65..eb302da 100644
 +    }
  }
 diff --git a/crates/remote/src/lib.rs b/crates/remote/src/lib.rs
-index a4fc0d2..f04d145 100644
+index 678ec7f..c1e28ae 100644
 --- a/crates/remote/src/lib.rs
 +++ b/crates/remote/src/lib.rs
 @@ -114,6 +114,15 @@ impl Place {
@@ -524,7 +580,7 @@ index a4fc0d2..f04d145 100644
          let dir = std::env::temp_dir().join(format!("shellwing-dav-img-{}", std::process::id()));
          let _ = std::fs::remove_dir_all(&dir);
          std::fs::create_dir_all(&dir).expect("dir");
-@@ -940,14 +980,14 @@ mod tests {
+@@ -941,14 +981,14 @@ mod tests {
      fn s3_two_devices(dir: &std::path::Path, place: impl Fn(&str) -> Place) {
          let a = Vault::open(&dir.join("a.db"), &MemoryKeys::default()).expect("a");
          let b = Vault::open(&dir.join("b.db"), &MemoryKeys::default()).expect("b");
@@ -542,7 +598,7 @@ index a4fc0d2..f04d145 100644
          );
          a.set_password("deploy@web", "from-a").expect("save");
          let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
-@@ -975,7 +1015,7 @@ mod tests {
+@@ -976,7 +1016,7 @@ mod tests {
              password: "pw".into(),
          };
          let e = place
@@ -551,7 +607,7 @@ index a4fc0d2..f04d145 100644
              .expect("open")
              .list("records")
              .expect_err("no server");
-@@ -1023,7 +1063,7 @@ mod tests {
+@@ -1024,7 +1064,7 @@ mod tests {
          let _ = std::fs::create_dir_all(dir);
          let a = Vault::open(&dir.join("race-a.db"), &MemoryKeys::default()).expect("a");
          let b = Vault::open(&dir.join("race-b.db"), &MemoryKeys::default()).expect("b");
@@ -560,7 +616,7 @@ index a4fc0d2..f04d145 100644
          a.set_password("deploy@web", "first").expect("save");
          let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
          a.sync(a_side.as_ref()).expect("sync a");
-@@ -1109,7 +1149,7 @@ mod tests {
+@@ -1111,7 +1151,7 @@ mod tests {
          let b = Vault::open(&dir.join("note-b.db"), &MemoryKeys::default()).expect("b");
          a.set_device_name("desk");
          b.set_device_name("laptop");
@@ -569,7 +625,7 @@ index a4fc0d2..f04d145 100644
          let note = write_note(&a, "", "df -h");
          let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
          a.sync(a_side.as_ref()).expect("sync a");
-@@ -1197,7 +1237,7 @@ mod tests {
+@@ -1199,7 +1239,7 @@ mod tests {
      /// Two backends on one place: what one wrote since the other last
      /// looked makes the other's write refused, once.
      fn conditional_writes(place: &Place) {
@@ -578,7 +634,7 @@ index a4fc0d2..f04d145 100644
          assert!(a.list("records").expect("list").is_empty());
          assert!(
              a.replace("records/x.sw", b"one").expect("new"),
-@@ -1245,7 +1285,7 @@ mod tests {
+@@ -1247,7 +1287,7 @@ mod tests {
          // The folder made first: this server refuses a new file in a folder
          // not made yet, as some do (the engine's own writes cover that).
          place
@@ -641,10 +697,10 @@ index 53ffd5f..41a2f63 100644
          proxy_command,
          forwards: vec![],
 diff --git a/crates/ssh/src/sftp.rs b/crates/ssh/src/sftp.rs
-index 736e820..89e0aea 100644
+index 43bcaf1..a67db24 100644
 --- a/crates/ssh/src/sftp.rs
 +++ b/crates/ssh/src/sftp.rs
-@@ -314,7 +314,8 @@ impl Sftp {
+@@ -400,7 +400,8 @@ impl Sftp {
              }
              todo.push((dir.clone(), true));
              for e in self.list(&dir).await? {
@@ -654,7 +710,7 @@ index 736e820..89e0aea 100644
                  if e.kind == Kind::Dir {
                      todo.push((p, false));
                  } else {
-@@ -514,7 +515,8 @@ impl Sftp {
+@@ -600,7 +601,8 @@ impl Sftp {
              let mut todo = vec![(remote.to_string(), local.to_path_buf())];
              while let Some((dir, to)) = todo.pop() {
                  for e in self.list(&dir).await? {
@@ -664,7 +720,7 @@ index 736e820..89e0aea 100644
                      match e.kind {
                          Kind::Dir => todo.push((from, into)),
                          Kind::File => files.push((from, into, e.size, e.modified)),
-@@ -557,9 +559,23 @@ impl Sftp {
+@@ -643,9 +645,23 @@ impl Sftp {
          let mut part_name = local.file_name().unwrap_or_default().to_os_string();
          part_name.push(".part");
          let part = local.with_file_name(part_name);
@@ -689,7 +745,7 @@ index 736e820..89e0aea 100644
          copy(&mut src, &mut dst, progress).await.map_err(io)?;
          dst.flush().await.map_err(io)?;
          let dst = dst.into_std().await;
-@@ -620,6 +636,26 @@ impl Sftp {
+@@ -706,6 +722,26 @@ impl Sftp {
      }
  }
  
@@ -716,7 +772,7 @@ index 736e820..89e0aea 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -644,4 +680,26 @@ mod tests {
+@@ -730,4 +766,26 @@ mod tests {
              assert!(bad_name(n).is_some(), "{n:?}");
          }
      }
@@ -1057,7 +1113,7 @@ index 3b33211..e71bf86 100644
  
  #[cfg(test)]
 diff --git a/crates/vault/src/lib.rs b/crates/vault/src/lib.rs
-index 313f429..cc4cd76 100644
+index 9a47290..a9f399c 100644
 --- a/crates/vault/src/lib.rs
 +++ b/crates/vault/src/lib.rs
 @@ -314,6 +314,15 @@ impl Kdf {
@@ -1076,7 +1132,7 @@ index 313f429..cc4cd76 100644
          let salt = base64::engine::general_purpose::STANDARD
              .decode(&self.salt)
              .map_err(|_| Error::Decrypt)?;
-@@ -913,6 +922,21 @@ impl Vault {
+@@ -916,6 +925,21 @@ impl Vault {
      fn open_db(path: &Path) -> Result<Opened> {
          if let Some(dir) = path.parent() {
              std::fs::create_dir_all(dir)?;
@@ -1098,7 +1154,7 @@ index 313f429..cc4cd76 100644
          }
          let db = Connection::open(path)?;
          db.execute_batch(
-@@ -2712,4 +2736,38 @@ mod tests {
+@@ -2727,4 +2751,38 @@ mod tests {
          assert!(v.items().expect("items").is_empty(), "not a password");
          let _ = std::fs::remove_dir_all(&dir);
      }

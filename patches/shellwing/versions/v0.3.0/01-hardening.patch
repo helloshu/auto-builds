@@ -1,0 +1,1139 @@
+diff --git a/android/gradle/wrapper/gradle-wrapper.properties b/android/gradle/wrapper/gradle-wrapper.properties
+index 91c4fc6..4b373a5 100644
+--- a/android/gradle/wrapper/gradle-wrapper.properties
++++ b/android/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,7 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+ distributionUrl=https\://services.gradle.org/distributions/gradle-9.8.2-bin.zip
++distributionSha256Sum=21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607
+ networkTimeout=10000
+ retries=0
+ retryBackOffMs=500
+diff --git a/crates/app/src/copies.rs b/crates/app/src/copies.rs
+index d6a5573..8380eb7 100644
+--- a/crates/app/src/copies.rs
++++ b/crates/app/src/copies.rs
+@@ -125,11 +125,13 @@ impl EditCopy {
+     }
+ 
+     fn new_in(run: &Path, remote: &str) -> io::Result<EditCopy> {
++        let name = sftp::safe_entry_name(sftp::name_of(remote))
++            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+         static NEXT: AtomicU32 = AtomicU32::new(0);
+         let dir = run.join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+         private_dir(&dir)?;
+         Ok(EditCopy {
+-            path: dir.join(sftp::name_of(remote)),
++            path: dir.join(name),
+             dir,
+             remote: remote.to_string(),
+             sent: None,
+diff --git a/crates/app/src/files.rs b/crates/app/src/files.rs
+index 47b938f..83fa06f 100644
+--- a/crates/app/src/files.rs
++++ b/crates/app/src/files.rs
+@@ -270,14 +270,15 @@ pub(crate) fn downloads_dir() -> PathBuf {
+ 
+ /// `name` in `dir`, or `name (1).ext`, `name (2).ext`… when taken.
+ pub(crate) fn unique(dir: &Path, name: &str, taken: &[&Path]) -> PathBuf {
++    let safe_name = sftp::safe_entry_name(name).unwrap_or("download");
+     let free = |p: &Path| !p.exists() && !taken.contains(&p);
+-    let first = dir.join(name);
++    let first = dir.join(safe_name);
+     if free(&first) {
+         return first;
+     }
+-    let (stem, ext) = match name.rfind('.') {
+-        Some(i) if i > 0 => (&name[..i], &name[i..]),
+-        _ => (name, ""),
++    let (stem, ext) = match safe_name.rfind('.') {
++        Some(i) if i > 0 => (&safe_name[..i], &safe_name[i..]),
++        _ => (safe_name, ""),
+     };
+     (1..)
+         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+@@ -748,6 +749,9 @@ impl FilesPanel {
+         let Some(e) = self.entries.get(ix).cloned() else {
+             return;
+         };
++        if let Err(err) = sftp::safe_entry_name(&e.name) {
++            return self.fail(err.to_string(), cx);
++        }
+         let taken: Vec<&Path> = self
+             .transfers
+             .iter()
+@@ -762,6 +766,9 @@ impl FilesPanel {
+         let Some(e) = self.entries.get(ix).cloned() else {
+             return;
+         };
++        if let Err(err) = sftp::safe_entry_name(&e.name) {
++            return self.fail(err.to_string(), cx);
++        }
+         let picked = cx.prompt_for_new_path(&self.downloads, Some(&e.name));
+         cx.spawn(async move |this, cx| {
+             if let Ok(Ok(Some(local))) = picked.await {
+@@ -776,6 +783,7 @@ impl FilesPanel {
+     /// place and moved there only once whole, so a drop never takes half of
+     /// it. Returns its place.
+     fn stage(&mut self, name: &str, cx: &mut Context<Self>) -> Option<PathBuf> {
++        let name = sftp::safe_entry_name(name).ok()?;
+         let dir = self.dir.clone()?;
+         let root = drag_folder()?;
+         clean_drags(&root);
+@@ -803,6 +811,9 @@ impl FilesPanel {
+ 
+     /// Downloads the entry `name` of the folder shown to `local`.
+     fn download_to(&mut self, name: &str, local: PathBuf, cx: &mut Context<Self>) {
++        if let Err(err) = sftp::safe_entry_name(name) {
++            return self.fail(err.to_string(), cx);
++        }
+         let Some(dir) = self.dir.clone() else {
+             return;
+         };
+diff --git a/crates/app/src/note_images.rs b/crates/app/src/note_images.rs
+index cf9f67e..687c4da 100644
+--- a/crates/app/src/note_images.rs
++++ b/crates/app/src/note_images.rs
+@@ -476,7 +476,7 @@ impl FetchError {
+ #[cfg(all(test, feature = "ui-tests"))]
+ pub static ALLOW_LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+ 
+-/// The public addresses `url`'s host has, or why it may not be reached.
++#[allow(dead_code)]
+ fn public_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, FetchError> {
+     use std::net::ToSocketAddrs;
+     let host = url
+@@ -499,57 +499,9 @@ fn public_addrs(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, FetchEr
+     Ok(addrs)
+ }
+ 
+-/// Downloads a note's web image (off the UI thread): its host must be on
+-/// the internet (checked again at each redirect), and the connection goes to
+-/// the addresses checked, so a name that changes its answer cannot lead it
+-/// elsewhere. 20 MB at most, 30 s in all.
+-pub fn fetch(url: &str) -> Result<Vec<u8>, FetchError> {
+-    let failed = |e: &dyn std::fmt::Display| FetchError::Failed(e.to_string());
+-    let parsed = reqwest::Url::parse(url).map_err(|e| failed(&e))?;
+-    if !matches!(parsed.scheme(), "https" | "http") {
+-        return Err(FetchError::Failed(parsed.scheme().to_string()));
+-    }
+-    let addrs = public_addrs(&parsed)?;
+-    let host = parsed.host_str().unwrap_or_default().to_string();
+-    let _ = rustls::crypto::ring::default_provider().install_default();
+-    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+-        if attempt.previous().len() >= 5 {
+-            attempt.error("too many redirects")
+-        } else if public_addrs(attempt.url()).is_err() {
+-            attempt.error("a redirect to a private network")
+-        } else {
+-            attempt.follow()
+-        }
+-    });
+-    let client = reqwest::Client::builder()
+-        .connect_timeout(std::time::Duration::from_secs(10))
+-        .timeout(std::time::Duration::from_secs(30))
+-        .redirect(redirects)
+-        .resolve_to_addrs(&host, &addrs)
+-        .user_agent(concat!("shellwing/", env!("CARGO_PKG_VERSION")))
+-        .build()
+-        .map_err(|e| failed(&e))?;
+-    let rt = tokio::runtime::Builder::new_current_thread()
+-        .enable_all()
+-        .build()
+-        .map_err(|e| failed(&e))?;
+-    rt.block_on(async move {
+-        let mut res = client.get(url).send().await.map_err(|e| failed(&e))?;
+-        if !res.status().is_success() {
+-            return Err(FetchError::Failed(res.status().to_string()));
+-        }
+-        if res.content_length().is_some_and(|n| n > DOWNLOAD_AT_MOST) {
+-            return Err(FetchError::TooLarge);
+-        }
+-        let mut out = vec![];
+-        while let Some(chunk) = res.chunk().await.map_err(|e| failed(&e))? {
+-            out.extend_from_slice(&chunk);
+-            if out.len() as u64 > DOWNLOAD_AT_MOST {
+-                return Err(FetchError::TooLarge);
+-            }
+-        }
+-        Ok(out)
+-    })
++/// Downloads a note's web image (disabled in hardened builds).
++pub fn fetch(_url: &str) -> Result<Vec<u8>, FetchError> {
++    Err(FetchError::Failed("external image fetching is disabled".into()))
+ }
+ 
+ /// What to put in place of `range` of `text` for images `ids`: one line each,
+diff --git a/crates/app/src/settings_view.rs b/crates/app/src/settings_view.rs
+index b766a3f..c5fd9fb 100644
+--- a/crates/app/src/settings_view.rs
++++ b/crates/app/src/settings_view.rs
+@@ -327,7 +327,7 @@ impl SyncForm {
+                 if url.is_empty() || user.is_empty() || password.is_empty() {
+                     return Err(tr!("Fill in the address, the user and the password."));
+                 }
+-                if !url.starts_with("https://") && !url.starts_with("http://") {
++                if !url.starts_with("https://") {
+                     return Err(tr!("The address starts with https://."));
+                 }
+                 Ok((SyncPlace::WebDav(WebDavSync { url, user }), Some(password)))
+@@ -351,8 +351,7 @@ impl SyncForm {
+                         "Fill in the endpoint, the bucket, the access key and its secret."
+                     ));
+                 }
+-                if !place.endpoint.starts_with("https://") && !place.endpoint.starts_with("http://")
+-                {
++                if !place.endpoint.starts_with("https://") {
+                     return Err(tr!("The endpoint starts with https://."));
+                 }
+                 Ok((SyncPlace::S3(place), Some(secret)))
+diff --git a/crates/app/src/workspace.rs b/crates/app/src/workspace.rs
+index 2d92460..2feb638 100644
+--- a/crates/app/src/workspace.rs
++++ b/crates/app/src/workspace.rs
+@@ -493,7 +493,7 @@ impl Workspace {
+             }
+         }
+         ws.share_settings(cx);
+-        ws.start_update_checks(cx);
++        // ws.start_update_checks(cx);
+         // The system editor's name is read from the desktop: once, off the UI thread.
+         std::thread::spawn(crate::editors::system_name);
+         // Edited copies an earlier run left behind: those holding changes
+diff --git a/crates/app/src/workspace/updates.rs b/crates/app/src/workspace/updates.rs
+index c55e6e4..039cc84 100644
+--- a/crates/app/src/workspace/updates.rs
++++ b/crates/app/src/workspace/updates.rs
+@@ -290,10 +290,7 @@ impl Workspace {
+ 
+     /// The release offered, unless skipped or already running.
+     pub(crate) fn update_offered(&self) -> Option<Version> {
+-        let s = &self.updates.state;
+-        let v = Version::parse(s.offered.as_deref()?)?;
+-        (v > shellwing_update::current() && s.skipped.as_deref() != s.offered.as_deref())
+-            .then_some(v)
++        None
+     }
+ 
+     /// The offered release: downloaded to install, when this copy can take
+diff --git a/crates/config/src/settings.rs b/crates/config/src/settings.rs
+index 3b3cf1e..35f8231 100644
+--- a/crates/config/src/settings.rs
++++ b/crates/config/src/settings.rs
+@@ -33,7 +33,7 @@ pub struct Updates {
+ 
+ impl Default for Updates {
+     fn default() -> Self {
+-        Updates { check: true }
++        Updates { check: false }
+     }
+ }
+ 
+diff --git a/crates/config/src/store.rs b/crates/config/src/store.rs
+index eee0080..8559fd9 100644
+--- a/crates/config/src/store.rs
++++ b/crates/config/src/store.rs
+@@ -695,8 +695,27 @@ const HOSTS_EXAMPLE: &str = "# Hosts for shellwing; `shellwing <name or alias>`
+ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+     let dir = path.parent().unwrap_or(Path::new("."));
+     fs::create_dir_all(dir)?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt as _;
++        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
++    }
+     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
++    #[cfg(unix)]
++    {
++        use std::io::Write as _;
++        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
++        let mut f = fs::OpenOptions::new()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .mode(0o600)
++            .open(&tmp)?;
++        f.set_permissions(fs::Permissions::from_mode(0o600))?;
++        f.write_all(contents.as_bytes())?;
++    }
++    #[cfg(not(unix))]
+     fs::write(&tmp, contents)?;
+     fs::rename(&tmp, path).inspect_err(|_| {
+         let _ = fs::remove_file(&tmp);
+@@ -1069,4 +1088,17 @@ mod tests {
+             format!("shellwing {}", other.display())
+         );
+     }
++
++    #[cfg(unix)]
++    #[test]
++    fn write_atomic_sets_private_permissions() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let dir = std::env::temp_dir().join(format!("shellwing-store-perm-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        let file = dir.join("config.toml");
++        write_atomic(&file, "check = false\n").expect("write");
++        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
++        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
++        let _ = fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/core/src/session.rs b/crates/core/src/session.rs
+index dd9866a..6abbfe3 100644
+--- a/crates/core/src/session.rs
++++ b/crates/core/src/session.rs
+@@ -652,10 +652,15 @@ impl Session {
+                 });
+             }
+             let (fwd_term, fwd_held) = (term.clone(), held.clone());
++            let use_agent = resolved.identity_agent != shellwing_ssh::config::IdentityAgent::Off
++                || resolved
++                    .jumps
++                    .iter()
++                    .any(|j| j.identity_agent != shellwing_ssh::config::IdentityAgent::Off);
+             let opts = Options {
+                 target: resolved,
+                 auth: Auth {
+-                    agent: true,
++                    agent: use_agent,
+                     // For scripts and benchmarks on a build of one's own:
+                     // a release never takes a password from the environment.
+                     password: cfg!(debug_assertions)
+diff --git a/crates/core/src/target.rs b/crates/core/src/target.rs
+index dd41f65..eb302da 100644
+--- a/crates/core/src/target.rs
++++ b/crates/core/src/target.rs
+@@ -75,8 +75,8 @@ fn from_host(
+             r.forwards.push(f.clone());
+         }
+     }
+-    // On here, or `ForwardAgent yes` for the address in ~/.ssh/config.
+-    r.forward_agent |= h.forward_agent;
++    // The host entry's explicit setting wins over ~/.ssh/config ForwardAgent.
++    r.forward_agent = h.forward_agent;
+     // Set here, it wins over ForwardX11 for the address.
+     match h.x11 {
+         None => {}
+@@ -95,16 +95,43 @@ fn from_host(
+         r.host_key = Some(policy(k));
+     }
+     r.certified_by = hosts.org_of(h).map(str::to_string);
+-    if h.auth.method == AuthMethod::Key
+-        && let Some(key) = &h.auth.key
+-    {
+-        // That key only: an agent's others first could use up the server's
+-        // tries (MaxAuthTries) before it, as IdentitiesOnly keeps them out.
+-        r.identities_only = true;
+-        // `vault:<id>`: a key the app keeps; else a key file.
+-        match key.strip_prefix(VAULT_KEY) {
+-            Some(id) => r.vault_key = Some(id.to_string()),
+-            None => r.identity_files = vec![expand_home(key)],
++    match h.auth.method {
++        AuthMethod::Auto => {}
++        AuthMethod::Key => {
++            if let Some(key) = &h.auth.key {
++                // That key only: an agent's others first could use up the server's
++                // tries (MaxAuthTries) before it, as IdentitiesOnly keeps them out.
++                r.identities_only = true;
++                r.skip_key_files = false;
++                // `vault:<id>`: a key the app keeps; else a key file.
++                match key.strip_prefix(VAULT_KEY) {
++                    Some(id) => {
++                        r.vault_key = Some(id.to_string());
++                        r.identity_files.clear();
++                    }
++                    None => {
++                        r.vault_key = None;
++                        r.identity_files = vec![expand_home(key)];
++                    }
++                }
++            }
++        }
++        AuthMethod::Agent => {
++            // Agent only: never read ~/.ssh/id_* or try Vault-stored private keys.
++            r.skip_key_files = true;
++            r.identity_files.clear();
++            r.vault_key = None;
++            r.identities_only = false;
++            if matches!(r.identity_agent, config::IdentityAgent::Off) {
++                r.identity_agent = config::IdentityAgent::Usual;
++            }
++        }
++        AuthMethod::Password => {
++            // Password only: never contact ssh-agent, ~/.ssh/id_*, or Vault keys.
++            r.skip_key_files = true;
++            r.identity_files.clear();
++            r.vault_key = None;
++            r.identity_agent = config::IdentityAgent::Off;
+         }
+     }
+     if !h.jump.is_empty() {
+@@ -351,4 +378,39 @@ mod tests {
+         let err = resolve("a", &h, None).expect_err("loop");
+         assert!(err.to_string().contains("loop"), "{err}");
+     }
++
++    #[test]
++    fn agent_and_password_methods_are_isolated_and_forward_agent_overrides_ssh_config() {
++        let dir = std::env::temp_dir().join(format!("shellwing-auth-iso-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).expect("dir");
++        let ssh = dir.join("config");
++        std::fs::write(
++            &ssh,
++            "Host *.lab\n  ForwardAgent yes\n  IdentityFile /tmp/leaked_key\n  IdentitiesOnly yes\n",
++        )
++        .expect("config");
++        let h = hosts(
++            "[[host]]\nname = \"ag\"\naddress = \"ag.lab\"\nforward_agent = false\n[host.auth]\nmethod = \"agent\"\n\n[[host]]\nname = \"pw\"\naddress = \"pw.lab\"\n[host.auth]\nmethod = \"password\"\n",
++        );
++
++        let (ag, _) = resolve("ag", &h, Some(&ssh)).expect("resolve ag");
++        assert!(!ag.forward_agent, "host forward_agent=false overrides ssh_config");
++        assert!(ag.skip_key_files);
++        assert!(ag.identity_files.is_empty());
++        assert!(ag.keys_to_try().is_empty());
++        assert_eq!(ag.vault_key, None);
++        assert!(!ag.identities_only);
++        assert_eq!(ag.identity_agent, config::IdentityAgent::Usual);
++
++        let (pw, _) = resolve("pw", &h, Some(&ssh)).expect("resolve pw");
++        assert!(!pw.forward_agent);
++        assert!(pw.skip_key_files);
++        assert!(pw.identity_files.is_empty());
++        assert!(pw.keys_to_try().is_empty());
++        assert_eq!(pw.vault_key, None);
++        assert_eq!(pw.identity_agent, config::IdentityAgent::Off);
++
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/remote/src/lib.rs b/crates/remote/src/lib.rs
+index a4fc0d2..f04d145 100644
+--- a/crates/remote/src/lib.rs
++++ b/crates/remote/src/lib.rs
+@@ -114,6 +114,15 @@ impl Place {
+     /// The backend that reads and writes there. Making a remote one does not
+     /// reach the server yet.
+     pub fn open(&self) -> io::Result<Arc<dyn Backend>> {
++        self.open_inner(false)
++    }
++
++    #[cfg(test)]
++    fn open_for_test(&self) -> io::Result<Arc<dyn Backend>> {
++        self.open_inner(true)
++    }
++
++    fn open_inner(&self, allow_http_in_test: bool) -> io::Result<Arc<dyn Backend>> {
+         match self {
+             Place::Folder(f) => Ok(Arc::new(Folder::new(f))),
+             Place::Server { url, refresh_token } => {
+@@ -124,7 +133,7 @@ impl Place {
+                 user,
+                 password,
+             } => {
+-                let (origin, path) = split_url(url)?;
++                let (origin, path) = split_url_inner(url, allow_http_in_test)?;
+                 let root = format!("{}/shellwing/", path.trim_end_matches('/'));
+                 let builder = services::Webdav::default()
+                     .endpoint(origin)
+@@ -146,6 +155,7 @@ impl Place {
+                 access_key,
+                 secret_key,
+             } => {
++                let _ = split_url_inner(endpoint, allow_http_in_test)?;
+                 let root = match prefix.trim_matches('/') {
+                     "" => "/shellwing/".to_string(),
+                     p => format!("/{p}/shellwing/"),
+@@ -207,11 +217,23 @@ fn clone_dir(url: &str, branch: &str) -> io::Result<PathBuf> {
+ 
+ /// `https://host:port` and the path after it (`/` if none).
+ fn split_url(url: &str) -> io::Result<(&str, &str)> {
++    split_url_inner(url, false)
++}
++
++fn split_url_inner(url: &str, allow_http_in_test: bool) -> io::Result<(&str, &str)> {
+     let url = url.trim();
++    let ok_scheme = url.starts_with("https://")
++        || (allow_http_in_test && url.starts_with("http://"));
++    if !ok_scheme {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "the address must start with https://",
++        ));
++    }
+     let after = url.find("://").map(|i| i + 3).ok_or_else(|| {
+         io::Error::new(
+             io::ErrorKind::InvalidInput,
+-            "the address must start with https:// (or http://)",
++            "the address must start with https://",
+         )
+     })?;
+     Ok(match url[after..].find('/') {
+@@ -747,11 +769,29 @@ mod tests {
+             split_url("https://cloud.example.com/remote.php/dav/").expect("url"),
+             ("https://cloud.example.com", "/remote.php/dav/")
+         );
+-        assert_eq!(
+-            split_url("http://nas:5005").expect("url"),
+-            ("http://nas:5005", "/")
+-        );
++        assert!(split_url("http://nas:5005").is_err());
+         assert!(split_url("cloud.example.com").is_err());
++        assert!(
++            Place::WebDav {
++                url: "http://nas:5005/dav/".into(),
++                user: "me".into(),
++                password: "pw".into(),
++            }
++            .open()
++            .is_err()
++        );
++        assert!(
++            Place::S3 {
++                endpoint: "http://127.0.0.1:9000".into(),
++                region: "us-east-1".into(),
++                bucket: "vault".into(),
++                prefix: String::new(),
++                access_key: "k".into(),
++                secret_key: "s".into(),
++            }
++            .open()
++            .is_err()
++        );
+     }
+ 
+     /// A WebDAV server in memory on a port of its own, counting the records
+@@ -809,7 +849,7 @@ mod tests {
+             user: "me".into(),
+             password: "pw".into(),
+         };
+-        let (a_side, b_side) = (place.open().expect("a"), place.open().expect("b"));
++        let (a_side, b_side) = (place.open_for_test().expect("a"), place.open_for_test().expect("b"));
+         let dir = std::env::temp_dir().join(format!("shellwing-dav-{}", std::process::id()));
+         let _ = std::fs::remove_dir_all(&dir);
+         std::fs::create_dir_all(&dir).expect("dir");
+@@ -852,7 +892,7 @@ mod tests {
+             user: "me".into(),
+             password: "pw".into(),
+         };
+-        let (a_side, b_side) = (place.open().expect("a"), place.open().expect("b"));
++        let (a_side, b_side) = (place.open_for_test().expect("a"), place.open_for_test().expect("b"));
+         let dir = std::env::temp_dir().join(format!("shellwing-dav-img-{}", std::process::id()));
+         let _ = std::fs::remove_dir_all(&dir);
+         std::fs::create_dir_all(&dir).expect("dir");
+@@ -940,14 +980,14 @@ mod tests {
+     fn s3_two_devices(dir: &std::path::Path, place: impl Fn(&str) -> Place) {
+         let a = Vault::open(&dir.join("a.db"), &MemoryKeys::default()).expect("a");
+         let b = Vault::open(&dir.join("b.db"), &MemoryKeys::default()).expect("b");
+-        let wrong = place("wrong").open().expect("open");
++        let wrong = place("wrong").open_for_test().expect("open");
+         assert!(
+             a.folder_state(wrong.as_ref()).is_err(),
+             "a wrong secret is refused"
+         );
+         let (a_side, b_side) = (
+-            place("s3cret").open().expect("a"),
+-            place("s3cret").open().expect("b"),
++            place("s3cret").open_for_test().expect("a"),
++            place("s3cret").open_for_test().expect("b"),
+         );
+         a.set_password("deploy@web", "from-a").expect("save");
+         let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
+@@ -975,7 +1015,7 @@ mod tests {
+             password: "pw".into(),
+         };
+         let e = place
+-            .open()
++            .open_for_test()
+             .expect("open")
+             .list("records")
+             .expect_err("no server");
+@@ -1023,7 +1063,7 @@ mod tests {
+         let _ = std::fs::create_dir_all(dir);
+         let a = Vault::open(&dir.join("race-a.db"), &MemoryKeys::default()).expect("a");
+         let b = Vault::open(&dir.join("race-b.db"), &MemoryKeys::default()).expect("b");
+-        let (a_side, b_side) = (place.open().expect("a"), place.open().expect("b"));
++        let (a_side, b_side) = (place.open_for_test().expect("a"), place.open_for_test().expect("b"));
+         a.set_password("deploy@web", "first").expect("save");
+         let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
+         a.sync(a_side.as_ref()).expect("sync a");
+@@ -1109,7 +1149,7 @@ mod tests {
+         let b = Vault::open(&dir.join("note-b.db"), &MemoryKeys::default()).expect("b");
+         a.set_device_name("desk");
+         b.set_device_name("laptop");
+-        let (a_side, b_side) = (place.open().expect("a"), place.open().expect("b"));
++        let (a_side, b_side) = (place.open_for_test().expect("a"), place.open_for_test().expect("b"));
+         let note = write_note(&a, "", "df -h");
+         let rk = a.start_sync(a_side.as_ref()).expect("start").to_string();
+         a.sync(a_side.as_ref()).expect("sync a");
+@@ -1197,7 +1237,7 @@ mod tests {
+     /// Two backends on one place: what one wrote since the other last
+     /// looked makes the other's write refused, once.
+     fn conditional_writes(place: &Place) {
+-        let (a, b) = (place.open().expect("a"), place.open().expect("b"));
++        let (a, b) = (place.open_for_test().expect("a"), place.open_for_test().expect("b"));
+         assert!(a.list("records").expect("list").is_empty());
+         assert!(
+             a.replace("records/x.sw", b"one").expect("new"),
+@@ -1245,7 +1285,7 @@ mod tests {
+         // The folder made first: this server refuses a new file in a folder
+         // not made yet, as some do (the engine's own writes cover that).
+         place
+-            .open()
++            .open_for_test()
+             .expect("open")
+             .write("records/.keep", b"")
+             .expect("folder");
+diff --git a/crates/ssh/src/auth.rs b/crates/ssh/src/auth.rs
+index 3425dab..37ab04d 100644
+--- a/crates/ssh/src/auth.rs
++++ b/crates/ssh/src/auth.rs
+@@ -209,6 +209,9 @@ pub(crate) enum StoredKeys<'a> {
+ impl<'a> StoredKeys<'a> {
+     /// A host's: its own key, else every one unless it names its key files.
+     pub(crate) fn of(hop: &'a crate::Resolved) -> Self {
++        if hop.skip_key_files {
++            return StoredKeys::None;
++        }
+         match (&hop.vault_key, hop.identity_files.is_empty()) {
+             (Some(id), _) => StoredKeys::Only(id),
+             (None, true) => StoredKeys::All,
+diff --git a/crates/ssh/src/config.rs b/crates/ssh/src/config.rs
+index 53ffd5f..41a2f63 100644
+--- a/crates/ssh/src/config.rs
++++ b/crates/ssh/src/config.rs
+@@ -75,6 +75,9 @@ pub struct Resolved {
+     /// which otherwise come before the key files and can use up the
+     /// server's tries (`MaxAuthTries`).
+     pub identities_only: bool,
++    /// Skip reading local key files (`~/.ssh/id_*` and `IdentityFile`) and
++    /// Vault-stored keys (used for `AuthMethod::Agent` and `AuthMethod::Password`).
++    pub skip_key_files: bool,
+     /// Hosts to go through first, outermost first; each has no jumps of its own.
+     pub jumps: Vec<Resolved>,
+     /// The command whose input and output carry the connection
+@@ -127,6 +130,7 @@ impl Resolved {
+             certified_by: None,
+             identity_agent: IdentityAgent::Usual,
+             identities_only: false,
++            skip_key_files: false,
+             jumps: vec![],
+             proxy_command: None,
+             keepalive: None,
+@@ -146,7 +150,7 @@ impl Resolved {
+     /// The key files to offer: none for a key the app keeps, the configured
+     /// ones, else the OpenSSH defaults that exist.
+     pub fn keys_to_try(&self) -> Vec<PathBuf> {
+-        if self.vault_key.is_some() {
++        if self.skip_key_files || self.vault_key.is_some() {
+             return vec![];
+         }
+         if !self.identity_files.is_empty() {
+@@ -1071,6 +1075,7 @@ fn resolve_with(reading: &Reading, spec: &str, chain: &mut Vec<String>) -> Resul
+         certified_by: None,
+         identity_agent,
+         identities_only,
++        skip_key_files: false,
+         jumps,
+         proxy_command,
+         forwards: vec![],
+diff --git a/crates/ssh/src/sftp.rs b/crates/ssh/src/sftp.rs
+index 736e820..89e0aea 100644
+--- a/crates/ssh/src/sftp.rs
++++ b/crates/ssh/src/sftp.rs
+@@ -314,7 +314,8 @@ impl Sftp {
+             }
+             todo.push((dir.clone(), true));
+             for e in self.list(&dir).await? {
+-                let p = join(&dir, &e.name);
++                let name = safe_entry_name(&e.name)?;
++                let p = join(&dir, name);
+                 if e.kind == Kind::Dir {
+                     todo.push((p, false));
+                 } else {
+@@ -514,7 +515,8 @@ impl Sftp {
+             let mut todo = vec![(remote.to_string(), local.to_path_buf())];
+             while let Some((dir, to)) = todo.pop() {
+                 for e in self.list(&dir).await? {
+-                    let (from, into) = (join(&dir, &e.name), to.join(&e.name));
++                    let name = safe_entry_name(&e.name)?;
++                    let (from, into) = (join(&dir, name), to.join(name));
+                     match e.kind {
+                         Kind::Dir => todo.push((from, into)),
+                         Kind::File => files.push((from, into, e.size, e.modified)),
+@@ -557,9 +559,23 @@ impl Sftp {
+         let mut part_name = local.file_name().unwrap_or_default().to_os_string();
+         part_name.push(".part");
+         let part = local.with_file_name(part_name);
++        if let Ok(meta) = tokio::fs::symlink_metadata(&part).await {
++            if !meta.is_file() {
++                return Err(Error::Sftp(format!(
++                    "refusing to overwrite non-regular partial path: {}",
++                    part.display()
++                )));
++            }
++            let _ = tokio::fs::remove_file(&part).await;
++        }
+         let mut src = self.0.open(remote).await.map_err(err)?;
+         let mut guard = Partial(Some(part.clone()));
+-        let mut dst = tokio::fs::File::create(&part).await.map_err(io)?;
++        let mut dst = tokio::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&part)
++            .await
++            .map_err(io)?;
+         copy(&mut src, &mut dst, progress).await.map_err(io)?;
+         dst.flush().await.map_err(io)?;
+         let dst = dst.into_std().await;
+@@ -620,6 +636,26 @@ impl Sftp {
+     }
+ }
+ 
++/// Validates a single remote directory entry name so it cannot escape a parent
++/// directory when joined to a local or remote path.
++pub fn safe_entry_name(name: &str) -> Result<&str, Error> {
++    let bytes = name.as_bytes();
++    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
++    if name.is_empty()
++        || name == "."
++        || name == ".."
++        || name.contains(['/', '\\', '\0'])
++        || has_drive_prefix
++    {
++        return Err(Error::Sftp(format!("unsafe file name: {name:?}")));
++    }
++    let mut comps = Path::new(name).components();
++    match (comps.next(), comps.next()) {
++        (Some(std::path::Component::Normal(_)), None) => Ok(name),
++        _ => Err(Error::Sftp(format!("unsafe file name: {name:?}"))),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -644,4 +680,26 @@ mod tests {
+             assert!(bad_name(n).is_some(), "{n:?}");
+         }
+     }
++
++    #[test]
++    fn safe_entry_name_rejects_traversal_and_separators() {
++        assert_eq!(safe_entry_name("notes.txt").unwrap(), "notes.txt");
++        assert_eq!(safe_entry_name(".bashrc").unwrap(), ".bashrc");
++        assert_eq!(safe_entry_name("backup-12:00.tar").unwrap(), "backup-12:00.tar");
++        for bad in [
++            "",
++            ".",
++            "..",
++            "../evil",
++            "a/b",
++            "a\\b",
++            "/etc/passwd",
++            "\\windows\\system32",
++            "C:evil",
++            "C:\\evil",
++            "a\0b",
++        ] {
++            assert!(safe_entry_name(bad).is_err(), "{bad:?}");
++        }
++    }
+ }
+diff --git a/crates/ssh/src/tokens.rs b/crates/ssh/src/tokens.rs
+index f8d1223..d45328a 100644
+--- a/crates/ssh/src/tokens.rs
++++ b/crates/ssh/src/tokens.rs
+@@ -2,6 +2,41 @@
+ 
+ use crate::{Error, Resolved};
+ 
++/// Reject values containing whitespace, control characters, quotes, or shell
++/// metacharacters before interpolating `%h`, `%r`, or `%n` into a command.
++fn check_token_value<'a>(val: &'a str, token: char, what: &str) -> Result<&'a str, Error> {
++    if val.is_empty()
++        || val.chars().any(|c| {
++            c.is_whitespace()
++                || c.is_control()
++                || matches!(
++                    c,
++                    '`' | '$'
++                        | ';'
++                        | '|'
++                        | '&'
++                        | '<'
++                        | '>'
++                        | '('
++                        | ')'
++                        | '{'
++                        | '}'
++                        | '\\'
++                        | '\''
++                        | '"'
++                        | '\n'
++                        | '\r'
++                        | '\0'
++                )
++        })
++    {
++        return Err(Error::Config(format!(
++            "{what}: unsafe value for %{token}: {val:?}"
++        )));
++    }
++    Ok(val)
++}
++
+ /// `text`, from `what` (`ProxyCommand`, `RemoteCommand`), with the tokens in
+ /// `takes` expanded: `%h` the host name, `%p` the port, `%r` the user, `%n`
+ /// the name as given, `%d` this machine's home, `%u` this machine's user. `%%`
+@@ -17,10 +52,10 @@ pub(crate) fn expand(text: &str, hop: &Resolved, what: &str, takes: &str) -> Res
+         match chars.next() {
+             Some('%') => out.push('%'),
+             Some(t) if takes.contains(t) => match t {
+-                'h' => out.push_str(&hop.target.host),
++                'h' => out.push_str(check_token_value(&hop.target.host, 'h', what)?),
+                 'p' => out.push_str(&hop.target.port.to_string()),
+-                'r' => out.push_str(&hop.target.user),
+-                'n' => out.push_str(&hop.alias),
++                'r' => out.push_str(check_token_value(&hop.target.user, 'r', what)?),
++                'n' => out.push_str(check_token_value(&hop.alias, 'n', what)?),
+                 'd' => out.push_str(
+                     &std::env::home_dir()
+                         .map(|h| h.to_string_lossy().into_owned())
+@@ -40,3 +75,50 @@ pub(crate) fn expand(text: &str, hop: &Resolved, what: &str, takes: &str) -> Res
+     }
+     Ok(out)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Target;
++
++    #[test]
++    fn rejects_shell_metacharacters_in_host_user_and_alias() {
++        for bad in [
++            "host;id",
++            "host$(id)",
++            "host`id`",
++            "host|cat",
++            "host&bg",
++            "host > /tmp/x",
++            "host'quote",
++            "host\"quote",
++            "host\nid",
++            "host name",
++        ] {
++            let mut hop = Resolved::direct(Target {
++                user: "alice".into(),
++                host: bad.into(),
++                port: 22,
++            });
++            assert!(expand("nc %h %p", &hop, "ProxyCommand", "hprn").is_err(), "{bad}");
++
++            hop.target.host = "ok.example".into();
++            hop.target.user = bad.into();
++            assert!(expand("ssh -l %r %h", &hop, "ProxyCommand", "hprn").is_err(), "{bad}");
++
++            hop.target.user = "alice".into();
++            hop.alias = bad.into();
++            assert!(expand("test %n", &hop, "Match exec", "hprndu").is_err(), "{bad}");
++        }
++
++        let hop = Resolved::direct(Target {
++            user: "alice_1".into(),
++            host: "web-01.example.com".into(),
++            port: 2222,
++        });
++        assert_eq!(
++            expand("nc -X connect %h %p", &hop, "ProxyCommand", "hprn").unwrap(),
++            "nc -X connect web-01.example.com 2222"
++        );
++    }
++}
+diff --git a/crates/update/src/download.rs b/crates/update/src/download.rs
+index 52a355f..9cf17f5 100644
+--- a/crates/update/src/download.rs
++++ b/crates/update/src/download.rs
+@@ -1,130 +1,31 @@
+ //! Downloading a release's file. It is kept only once its SHA-256 is the
+ //! one the signed list names: the list's signatures vouch for the file.
+ 
+-use std::io::Write as _;
+ use std::path::Path;
+-use std::time::Duration;
+-
+-use sha2::{Digest, Sha256};
+ 
+ use crate::CheckError;
+ 
+-/// A release's file is not bigger than this.
+-const MOST_FILE: u64 = 512 << 20;
+-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+-/// No byte for this long: the download has stalled.
+-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+-
+-/// Downloads `url` to `dest`, telling `progress` the bytes so far and the
+-/// size when known; `dest` is there only once whole and of `sha256`.
++/// Downloads `url` to `dest` (disabled in hardened builds).
+ pub async fn download(
+-    url: &str,
+-    sha256: &str,
+-    dest: &Path,
+-    progress: impl Fn(u64, Option<u64>),
++    _url: &str,
++    _sha256: &str,
++    _dest: &Path,
++    _progress: impl Fn(u64, Option<u64>),
+ ) -> Result<(), CheckError> {
+-    let fail = |e: &dyn std::fmt::Display| CheckError::Fetch(e.to_string());
+-    let io = |e: std::io::Error| CheckError::Io(e.to_string());
+-    let _ = rustls::crypto::ring::default_provider().install_default();
+-    let client = reqwest::Client::builder()
+-        .connect_timeout(CONNECT_TIMEOUT)
+-        .read_timeout(READ_TIMEOUT)
+-        .user_agent(concat!("shellwing/", env!("CARGO_PKG_VERSION")))
+-        .build()
+-        .map_err(|e| fail(&e))?;
+-    let mut res = client.get(url).send().await.map_err(|e| fail(&e))?;
+-    if !res.status().is_success() {
+-        return Err(CheckError::Fetch(format!("{url}: {}", res.status())));
+-    }
+-    let total = res.content_length();
+-    if total.is_some_and(|n| n > MOST_FILE) {
+-        return Err(CheckError::Fetch(format!("{url}: too large")));
+-    }
+-    if let Some(dir) = dest.parent() {
+-        std::fs::create_dir_all(dir).map_err(io)?;
+-    }
+-    let part = dest.with_extension("part");
+-    let mut file = std::fs::File::create(&part).map_err(io)?;
+-    let mut hash = Sha256::new();
+-    let mut got = 0u64;
+-    while let Some(chunk) = res.chunk().await.map_err(|e| fail(&e))? {
+-        got += chunk.len() as u64;
+-        if got > MOST_FILE {
+-            let _ = std::fs::remove_file(&part);
+-            return Err(CheckError::Fetch(format!("{url}: too large")));
+-        }
+-        hash.update(&chunk);
+-        file.write_all(&chunk).map_err(io)?;
+-        progress(got, total);
+-    }
+-    file.sync_all().map_err(io)?;
+-    drop(file);
+-    let sum: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+-    if sum != sha256 {
+-        let _ = std::fs::remove_file(&part);
+-        return Err(CheckError::Checksum);
+-    }
+-    std::fs::rename(&part, dest).map_err(io)?;
+-    Ok(())
++    Err(CheckError::NoList)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use std::io::Read as _;
+-
+     use super::*;
+ 
+-    /// Serves `body` once on a port of this machine; its URL.
+-    fn serve_once(body: &'static [u8]) -> String {
+-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+-        let addr = listener.local_addr().expect("addr");
+-        std::thread::spawn(move || {
+-            let (mut conn, _) = listener.accept().expect("accept");
+-            let mut req = [0u8; 1024];
+-            let _ = conn.read(&mut req);
+-            let head = format!(
+-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+-                body.len()
+-            );
+-            let _ = conn.write_all(head.as_bytes());
+-            let _ = conn.write_all(body);
+-        });
+-        format!("http://{addr}/release")
+-    }
+-
+-    fn sha256_of(data: &[u8]) -> String {
+-        Sha256::digest(data)
+-            .iter()
+-            .map(|b| format!("{b:02x}"))
+-            .collect()
+-    }
+-
+     #[tokio::test]
+-    async fn a_download_is_kept_only_when_its_hash_is_the_listed_one() {
++    async fn download_is_disabled_in_hardened_builds() {
+         let dir = std::env::temp_dir().join(format!("shellwing-download-{}", std::process::id()));
+         let _ = std::fs::remove_dir_all(&dir);
+         let dest = dir.join("shellwing.AppImage");
+-        let body: &[u8] = b"the release";
+-
+-        let seen = std::sync::Mutex::new(Vec::new());
+-        download(&serve_once(body), &sha256_of(body), &dest, |n, of| {
+-            seen.lock().expect("seen").push((n, of));
+-        })
+-        .await
+-        .expect("download");
+-        assert_eq!(std::fs::read(&dest).expect("read"), body);
+-        let seen = seen.into_inner().expect("seen");
+-        assert_eq!(
+-            seen.last(),
+-            Some(&(body.len() as u64, Some(body.len() as u64)))
+-        );
+-
+-        std::fs::remove_file(&dest).expect("rm");
+-        let wrong = download(&serve_once(body), &sha256_of(b"another"), &dest, |_, _| {}).await;
+-        assert!(matches!(wrong, Err(CheckError::Checksum)), "{wrong:?}");
+-        // Neither the file nor its part is left.
+-        let left: Vec<_> = std::fs::read_dir(&dir).expect("ls").flatten().collect();
+-        assert!(left.is_empty(), "{left:?}");
+-        let _ = std::fs::remove_dir_all(&dir);
++        let res = download("https://example.invalid/release", "deadbeef", &dest, |_, _| {}).await;
++        assert!(matches!(res, Err(CheckError::NoList)), "{res:?}");
++        assert!(!dest.exists());
+     }
+ }
+diff --git a/crates/update/src/lib.rs b/crates/update/src/lib.rs
+index 3b33211..e71bf86 100644
+--- a/crates/update/src/lib.rs
++++ b/crates/update/src/lib.rs
+@@ -39,7 +39,9 @@ pub const LIST_URL: &str = match option_env!("SHELLWING_UPDATE_LIST") {
+ };
+ 
+ /// The list is small; anything bigger is not it.
++#[allow(dead_code)]
+ const MOST_LIST: usize = 1 << 20;
++#[allow(dead_code)]
+ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ /// The page a release is downloaded from.
+@@ -224,39 +226,9 @@ pub fn offer(envelope: &[u8], current: &Version) -> Result<Option<Version>, Chec
+     Ok(Manifest::parse(&data)?.offer(current))
+ }
+ 
+-/// Reads the signed list from `url`.
+-pub async fn fetch(url: &str) -> Result<Vec<u8>, CheckError> {
+-    let fail = |e: &dyn std::fmt::Display| CheckError::Fetch(e.to_string());
+-    // reqwest on rustls with ring, as the sync places use it. Once is
+-    // enough; again is harmless (the first one installed stays).
+-    let _ = rustls::crypto::ring::default_provider().install_default();
+-    let client = reqwest::Client::builder()
+-        .timeout(FETCH_TIMEOUT)
+-        .user_agent(concat!("shellwing/", env!("CARGO_PKG_VERSION")))
+-        .build()
+-        .map_err(|e| fail(&e))?;
+-    let res = client.get(url).send().await.map_err(|e| fail(&e))?;
+-    if res.status() == reqwest::StatusCode::NOT_FOUND {
+-        return Err(CheckError::NoList);
+-    }
+-    if !res.status().is_success() {
+-        return Err(CheckError::Fetch(format!(
+-            "the list of releases: {}",
+-            res.status()
+-        )));
+-    }
+-    if res.content_length().is_some_and(|n| n as usize > MOST_LIST) {
+-        return Err(CheckError::Fetch(
+-            "the list of releases is too large".into(),
+-        ));
+-    }
+-    let body = res.bytes().await.map_err(|e| fail(&e))?;
+-    if body.len() > MOST_LIST {
+-        return Err(CheckError::Fetch(
+-            "the list of releases is too large".into(),
+-        ));
+-    }
+-    Ok(body.to_vec())
++/// Reads the signed list from `url` (disabled in hardened builds).
++pub async fn fetch(_url: &str) -> Result<Vec<u8>, CheckError> {
++    Err(CheckError::NoList)
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/vault/src/lib.rs b/crates/vault/src/lib.rs
+index 313f429..cc4cd76 100644
+--- a/crates/vault/src/lib.rs
++++ b/crates/vault/src/lib.rs
+@@ -314,6 +314,15 @@ impl Kdf {
+                 self.alg
+             )));
+         }
++        if !(1..=262_144).contains(&self.m_kib)
++            || !(1..=10).contains(&self.t)
++            || !(1..=4).contains(&self.p)
++        {
++            return Err(Error::Keychain(format!(
++                "unreasonable Argon2 parameters: m={} KiB, t={}, p={}",
++                self.m_kib, self.t, self.p
++            )));
++        }
+         let salt = base64::engine::general_purpose::STANDARD
+             .decode(&self.salt)
+             .map_err(|_| Error::Decrypt)?;
+@@ -913,6 +922,21 @@ impl Vault {
+     fn open_db(path: &Path) -> Result<Opened> {
+         if let Some(dir) = path.parent() {
+             std::fs::create_dir_all(dir)?;
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::PermissionsExt as _;
++                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
++            }
++        }
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
++            let _ = std::fs::OpenOptions::new()
++                .write(true)
++                .create(true)
++                .mode(0o600)
++                .open(path)?;
++            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+         }
+         let db = Connection::open(path)?;
+         db.execute_batch(
+@@ -2712,4 +2736,38 @@ mod tests {
+         assert!(v.items().expect("items").is_empty(), "not a password");
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    #[test]
++    fn kdf_rejects_unreasonable_argon2_parameters_and_open_sets_private_mode() {
++        let valid = Kdf::new().expect("kdf");
++        for (m_kib, t, p) in [
++            (0, 1, 1),
++            (512 * 1024, 1, 1),
++            (256, 0, 1),
++            (256, 11, 1),
++            (256, 1, 0),
++            (256, 1, 5),
++        ] {
++            let bad = Kdf {
++                alg: "argon2id".into(),
++                m_kib,
++                t,
++                p,
++                salt: valid.salt.clone(),
++            };
++            assert!(bad.key("passphrase").is_err(), "{m_kib}/{t}/{p}");
++        }
++
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt as _;
++            let dir = std::env::temp_dir().join(format!("shellwing-vault-perm-{}", std::process::id()));
++            let _ = std::fs::remove_dir_all(&dir);
++            let db = dir.join("vault.db");
++            let _v = Vault::open(&db, &MemoryKeys::default()).expect("open");
++            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
++            assert_eq!(std::fs::metadata(&db).unwrap().permissions().mode() & 0o777, 0o600);
++            let _ = std::fs::remove_dir_all(&dir);
++        }
++    }
+ }

@@ -296,6 +296,25 @@ def find_or_create_draft(
             clean_starter_assets(vault_repo, vault_token, item)
             return item
 
+    for item in releases:
+        if (
+            item.get("draft")
+            and (item.get("tag_name") or "").startswith("untagged-")
+            and item.get("name") == title
+        ):
+            healed = gh_request(
+                "PATCH",
+                f"https://api.github.com/repos/{vault_repo}/releases/{item['id']}",
+                token=vault_token,
+                data={
+                    "tag_name": release_tag,
+                    "name": title,
+                    "draft": True,
+                },
+            )
+            clean_starter_assets(vault_repo, vault_token, healed)
+            return healed
+
     return gh_request(
         "POST",
         f"https://api.github.com/repos/{vault_repo}/releases",
@@ -689,10 +708,12 @@ def cmd_publish_release(
         f"https://api.github.com/repos/{vault_repo}/releases/{rel_id}",
         token=vault_token,
         data={
+            "tag_name": release_tag,
             "name": f"{cfg['DISPLAY_NAME']} {cfg['UPSTREAM_TAG']}",
             "body": notes_body + provenance_footer,
             "draft": target_draft,
         },
+        retries=3,
     )
     if target_draft:
         print(f"[publish] staged partial assets into draft release {release_tag}")
